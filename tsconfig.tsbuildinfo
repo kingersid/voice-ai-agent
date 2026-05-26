@@ -1,0 +1,1 @@
+{"root":["./src/main.tsx","./src/vite-env.d.ts","./src/lib/mcp-client.ts","./src/lib/mcp-server.test.ts","./src/lib/mcp-server.ts","./src/lib/mcp-transport.ts","./src/lib/mcp-types.ts","./vite.config.ts"],"version":"5.8.3"}
