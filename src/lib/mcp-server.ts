@@ -19,6 +19,68 @@ import {
   createErrorResponse,
 } from "./mcp-types";
 import type { InMemoryTransport } from "./mcp-transport";
+import * as obsidian from "./obsidian-client";
+
+// ─── Tavily Rate Limiter ─────────────────────────────────────────────────────
+// Tavily free tier typically allows ~1 request/sec burst and ~1000 req/month.
+// This ensures we never exceed a safe per-second threshold.
+
+let TAVILY_MIN_INTERVAL_MS = 3_000; // at least 3s between searches
+const TAVILY_MAX_QUEUE = 5;            // drop excess if queue piles up
+
+let _tavilyLastSearch = 0;
+let _tavilyQueue: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+let _tavilyProcessing = false;
+
+/**
+ * Override the rate-limiter interval (e.g. set to 0 in tests).
+ * Pass -1 to reset to the default (3s).
+ */
+export function setTavilyRateLimit(ms: number): void {
+  TAVILY_MIN_INTERVAL_MS = ms < 0 ? 3_000 : ms;
+}
+
+function processTavilyQueue(): void {
+  if (_tavilyProcessing || _tavilyQueue.length === 0) return;
+  _tavilyProcessing = true;
+
+  const now = Date.now();
+  const elapsed = now - _tavilyLastSearch;
+  const delay = Math.max(0, TAVILY_MIN_INTERVAL_MS - elapsed);
+
+  if (delay > 0) {
+    setTimeout(() => {
+      _tavilyLastSearch = Date.now();
+      const item = _tavilyQueue.shift();
+      if (item) item.resolve();
+      _tavilyProcessing = false;
+      processTavilyQueue();
+    }, delay);
+  } else {
+    _tavilyLastSearch = now;
+    const item = _tavilyQueue.shift();
+    if (item) item.resolve();
+    _tavilyProcessing = false;
+    processTavilyQueue();
+  }
+}
+
+/** Wait for the green light to call the Tavily API (rate-limited queue). */
+function acquireTavilySlot(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (_tavilyQueue.length >= TAVILY_MAX_QUEUE) {
+      // Queue is full — reject the oldest pending item to make room
+      const oldest = _tavilyQueue.shift();
+      if (oldest) oldest.reject(new Error("Web search queue full. Try again in a moment."));
+    }
+
+    _tavilyQueue.push({ resolve, reject });
+
+    if (!_tavilyProcessing) {
+      processTavilyQueue();
+    }
+  });
+}
 
 // ─── Vault Data ────────────────────────────────────────────────────────────
 
@@ -108,7 +170,7 @@ const TOOLS: Tool[] = [
   {
     name: "read_note",
     title: "Read Vault Note",
-    description: "Read a note from My Vault by its filename.",
+    description: "Read a note from your Obsidian vault by its filename. Reads from the real Obsidian vault when Obsidian is running with the Local REST API plugin enabled. Falls back to cached notes if Obsidian is unavailable.",
     inputSchema: {
       type: "object",
       properties: {
@@ -123,13 +185,13 @@ const TOOLS: Tool[] = [
   {
     name: "search_vault",
     title: "Search Vault Notes",
-    description: "Search through all notes in My Vault (filenames and content) for a given query. Returns up to 3 matching notes with content previews.",
+    description: "Search through all notes in your Obsidian vault (filenames and content) for a given query. Uses Obsidian's built-in search when available. Falls back to cached notes if Obsidian is unavailable. Returns up to 3 matching notes with content previews.",
     inputSchema: {
       type: "object",
       properties: {
         query: {
           type: "string",
-          description: "The search query to find in My Vault",
+          description: "The search query to find in the vault",
         },
       },
       required: ["query"],
@@ -138,7 +200,7 @@ const TOOLS: Tool[] = [
   {
     name: "web_search",
     title: "Search the Web",
-    description: "Search the web for current information using Tavily. Call this when the user asks about news, weather, current events, or any topic where fresh info is needed.",
+    description: "Search the web using Tavily for current information on any topic. Call this for questions about places, travel, geography, history, culture, news, weather, current events, or ANY factual topic where external knowledge is needed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -153,7 +215,7 @@ const TOOLS: Tool[] = [
   {
     name: "save_note",
     title: "Save Vault Note",
-    description: "Save or update a note in My Vault. Creates a new note or overwrites an existing one.",
+    description: "Save or update a note in your Obsidian vault. Creates a new note or overwrites an existing one. Writes directly to the real Obsidian vault when Obsidian is running with the Local REST API plugin enabled.",
     inputSchema: {
       type: "object",
       properties: {
@@ -207,6 +269,41 @@ const TOOLS: Tool[] = [
       required: ["command"],
     },
   },
+  {
+    name: "list_vault",
+    title: "List Vault Files",
+    description: "List files and folders in your Obsidian vault at a given path. Use this to browse the vault structure and discover what notes are available.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Optional subdirectory path to list (e.g., 'wiki/', 'daily/'). Leave empty or omit to list the vault root.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "get_active_file",
+    title: "Get Active Obsidian File",
+    description: "Get the path and content of the currently active (open) file in Obsidian. Useful for understanding what the user is currently working on.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "get_daily_note",
+    title: "Get Today's Daily Note",
+    description: "Get today's daily note from the Obsidian vault. Requires the Periodic Notes plugin or similar daily note setup in Obsidian.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
 ];
 
 // ─── MCP Server ────────────────────────────────────────────────────────────
@@ -248,17 +345,23 @@ export class MCPServer {
       case "get_time":
         return this.handleGetTime();
       case "read_note":
-        return this.handleReadNote(args);
+        return await this.handleReadNote(args);
       case "search_vault":
-        return this.handleSearchVault(args);
+        return await this.handleSearchVault(args);
       case "web_search":
         return await this.handleWebSearch(args);
       case "save_note":
-        return this.handleSaveNote(args);
+        return await this.handleSaveNote(args);
       case "write_file":
         return await this.handleWriteFile(args);
       case "execute_command":
         return await this.handleExecuteCommand(args);
+      case "list_vault":
+        return await this.handleListVault(args);
+      case "get_active_file":
+        return await this.handleGetActiveFile();
+      case "get_daily_note":
+        return await this.handleGetDailyNote();
       default:
         return {
           content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -431,16 +534,28 @@ export class MCPServer {
     };
   }
 
-  private handleReadNote(args: Record<string, unknown>): ToolCallResult {
+  private async handleReadNote(args: Record<string, unknown>): Promise<ToolCallResult> {
     const filename = String(args.filename ?? "");
-    const entry = this.vault.get(filename);
 
+    // Try reading from the real Obsidian vault first
+    if (obsidian.isObsidianConfigured()) {
+      const result = await obsidian.readVaultFile(filename);
+      if (result.ok) {
+        return {
+          content: [{ type: "text", text: `[${result.filename}]\n${result.content}` }],
+        };
+      }
+      // If not found in Obsidian, fall through to in-memory vault
+    }
+
+    // Fall back to in-memory vault
+    const entry = this.vault.get(filename);
     if (!entry) {
       return {
         content: [
           {
             type: "text",
-            text: `Note not found: ${filename}. Available notes: ${Array.from(this.vault.keys()).join(", ")}`,
+            text: `Note not found in Obsidian or cache: ${filename}. Available notes: ${Array.from(this.vault.keys()).join(", ")}`,
           },
         ],
         isError: true,
@@ -448,23 +563,45 @@ export class MCPServer {
     }
 
     return {
-      content: [{ type: "text", text: `[${filename}]\n${entry.content}` }],
+      content: [{ type: "text", text: `[${filename}] (cached)\n${entry.content}` }],
     };
   }
 
-  private handleSearchVault(args: Record<string, unknown>): ToolCallResult {
-    const query = String(args.query ?? "").toLowerCase();
+  private async handleSearchVault(args: Record<string, unknown>): Promise<ToolCallResult> {
+    const query = String(args.query ?? "");
+
+    // Try searching the real Obsidian vault first
+    if (obsidian.isObsidianConfigured()) {
+      const result = await obsidian.simpleSearch(query);
+      if (result.ok && result.results.length > 0) {
+        const limited = result.results.slice(0, 3);
+        const lines = await Promise.all(
+          limited.map(async (r, i) => {
+            // Try to fetch a snippet from each result
+            const full = await obsidian.readVaultFile(r.path);
+            const snippet = full.ok ? full.content.slice(0, 300) : (r.match ?? "");
+            return `${i + 1}. [${r.path}]\n   ${snippet}`;
+          }),
+        );
+        return {
+          content: [{ type: "text", text: `Search results for "${query}" in Obsidian vault:\n\n${lines.join("\n\n---\n\n")}` }],
+        };
+      }
+    }
+
+    // Fall back to in-memory vault search
+    const lowerQuery = query.toLowerCase();
     const matches = Array.from(this.vault.entries())
       .filter(
         ([key, val]) =>
-          key.toLowerCase().includes(query) ||
-          val.content.toLowerCase().includes(query)
+          key.toLowerCase().includes(lowerQuery) ||
+          val.content.toLowerCase().includes(lowerQuery)
       )
       .slice(0, 3);
 
     if (matches.length === 0) {
       return {
-        content: [{ type: "text", text: `No results found for "${query}" in vault.` }],
+        content: [{ type: "text", text: `No results found for "${query}" in vault (Obsidian or cache).` }],
       };
     }
 
@@ -476,7 +613,7 @@ export class MCPServer {
       .join("\n\n---\n\n");
 
     return {
-      content: [{ type: "text", text: `Search results for "${query}":\n\n${results}` }],
+      content: [{ type: "text", text: `Search results for "${query}" (from cache):\n\n${results}` }],
     };
   }
 
@@ -499,13 +636,14 @@ export class MCPServer {
     }
 
     try {
+      // Wait for a rate-limited slot before hitting the Tavily API
+      await acquireTavilySlot();
+
       const res = await fetch("/api/tavily/search", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          api_key: apiKey,
           query,
           search_depth: "basic",
           max_results: 5,
@@ -551,7 +689,7 @@ export class MCPServer {
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
-      console.error("[web_search] Fetch failed:", err);
+      console.error("[web_search] Failed:", err);
       return {
         content: [{ type: "text", text: `Web search failed: ${msg}` }],
         isError: true,
@@ -659,35 +797,171 @@ export class MCPServer {
       };
     }
 
-    // Always save to in-memory vault for immediate access
+    // Always cache in the in-memory vault
     this.vault.set(filename, {
       filename,
       content,
       mimeType: "text/markdown",
     });
 
-    // Also persist to GitHub via the backend server
+    // Try writing to the real Obsidian vault first
+    if (obsidian.isObsidianConfigured()) {
+      const result = await obsidian.writeVaultFile(filename, content);
+      if (result.ok) {
+        console.log("[vault] Saved to Obsidian:", result.path);
+        // Also try GitHub backup (best-effort)
+        await this.tryGitHubBackup(filename, content);
+        return {
+          content: [{ type: "text", text: `Note saved to Obsidian vault: ${filename} (${result.chars} chars)` }],
+        };
+      }
+      console.warn("[vault] Obsidian save failed, cached in-memory:", result.error);
+    }
+
+    // Fall back to GitHub backup as second persistence layer
+    const gitHubOk = await this.tryGitHubBackup(filename, content);
+    if (gitHubOk) {
+      return {
+        content: [{ type: "text", text: `Note saved to cache and GitHub: ${filename} (${content.length} chars)` }],
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: `Note cached in-memory: ${filename} (${content.length} chars). Enable Obsidian Local REST API for persistent saves.` }],
+    };
+  }
+
+  private async tryGitHubBackup(filename: string, content: string): Promise<boolean> {
     try {
       const res = await fetch("/api/vault/save", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ filename, content }),
       });
-
       if (res.ok) {
         const data = await res.json();
-        console.log("[vault] Saved to GitHub:", data.path);
-      } else {
-        const err = await res.json();
-        console.warn("[vault] GitHub save failed:", err.error);
+        console.log("[vault] GitHub backup saved:", data.path);
+        return true;
       }
-    } catch (err) {
-      // Backend server might not be running (e.g. in preview mode)
-      console.warn("[vault] GitHub backend unavailable — note saved in-memory only");
+      const err = await res.json();
+      console.warn("[vault] GitHub backup failed:", err.error);
+      return false;
+    } catch {
+      console.warn("[vault] GitHub backend unavailable");
+      return false;
+    }
+  }
+
+  // ── New Tool Handlers ─────────────────────────────────────────────────
+
+  private async handleListVault(args: Record<string, unknown>): Promise<ToolCallResult> {
+    const dirPath = String(args.path ?? "");
+
+    // Try Obsidian first
+    if (obsidian.isObsidianConfigured()) {
+      const result = await obsidian.listVaultDirectory(dirPath);
+      if (result.ok) {
+        const folders = result.files.filter((f) => f.type === "folder");
+        const files = result.files.filter((f) => f.type === "file");
+        let text = `Contents of "${dirPath || "root"}" in Obsidian vault:`;
+        if (folders.length > 0) {
+          text += `\n\n📁 Folders:\n  ${folders.map((f) => f.name).join("\n  ")}`;
+        }
+        if (files.length > 0) {
+          text += `\n\n📄 Files:\n  ${files.map((f) => f.name).join("\n  ")}`;
+        }
+        if (result.files.length === 0) {
+          text += "\n  (empty)";
+        }
+        return { content: [{ type: "text", text }] };
+      }
+      return {
+        content: [{ type: "text", text: `Could not list vault: ${result.error}` }],
+        isError: true,
+      };
+    }
+
+    // Fall back to listing from in-memory vault
+    const prefix = dirPath ? dirPath.replace(/\/$/, "") + "/" : "";
+    const files = Array.from(this.vault.keys())
+      .filter((k) => k.startsWith(prefix))
+      .map((k) => k.slice(prefix.length).split("/")[0])
+      .filter((v, i, a) => a.indexOf(v) === i);
+    if (files.length === 0) {
+      return {
+        content: [{ type: "text", text: `No cached files at "${dirPath || "root"}". Obsidian is not connected — cached notes are limited.` }],
+      };
+    }
+    return {
+      content: [{ type: "text", text: `Contents of "${dirPath || "root"}" (from cache):\n  ${files.join("\n  ")}` }],
+    };
+  }
+
+  private async handleGetActiveFile(): Promise<ToolCallResult> {
+    if (!obsidian.isObsidianConfigured()) {
+      return {
+        content: [{ type: "text", text: "Obsidian is not connected. Open Obsidian with the Local REST API plugin enabled to use this tool." }],
+        isError: true,
+      };
+    }
+
+    const active = await obsidian.getActiveFilePath();
+    if (!active.ok) {
+      return {
+        content: [{ type: "text", text: `Could not get active file: ${active.error}` }],
+        isError: true,
+      };
+    }
+
+    if (!active.path) {
+      return {
+        content: [{ type: "text", text: "No file is currently open in Obsidian." }],
+      };
+    }
+
+    const content = await obsidian.readVaultFile(active.path);
+    if (!content.ok) {
+      return {
+        content: [{ type: "text", text: `Active file: ${active.path}\n(but could not read content: ${content.error})` }],
+      };
     }
 
     return {
-      content: [{ type: "text", text: `Note saved: ${filename} (${content.length} chars)` }],
+      content: [{ type: "text", text: `📍 Active file: ${active.path}\n\n${content.content}` }],
+    };
+  }
+
+  private async handleGetDailyNote(): Promise<ToolCallResult> {
+    if (!obsidian.isObsidianConfigured()) {
+      return {
+        content: [{ type: "text", text: "Obsidian is not connected. Open Obsidian with the Local REST API plugin enabled to use this tool." }],
+        isError: true,
+      };
+    }
+
+    const daily = await obsidian.getPeriodicNotePath("daily");
+    if (!daily.ok) {
+      return {
+        content: [{ type: "text", text: `Could not find today's daily note: ${daily.error}` }],
+        isError: true,
+      };
+    }
+
+    if (!daily.path) {
+      return {
+        content: [{ type: "text", text: "No daily note found for today. Create one in Obsidian first." }],
+      };
+    }
+
+    const content = await obsidian.readVaultFile(daily.path);
+    if (!content.ok) {
+      return {
+        content: [{ type: "text", text: `Daily note: ${daily.path}\n(but could not read: ${content.error})` }],
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: `📅 Today's daily note (${daily.path}):\n\n${content.content}` }],
     };
   }
 }

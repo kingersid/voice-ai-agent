@@ -234,3 +234,22 @@ export function createNotification(method: string, params?: Record<string, unkno
     params,
   };
 }
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/** Extract text content from a ToolCallResult, joining multiple text blocks. */
+export function getToolResultText(result: ToolCallResult): string {
+  return result.content
+    .filter((c): c is TextContent => c.type === "text")
+    .map((c) => c.text)
+    .join("\n");
+}
+
+/** Parse tool call arguments from a string safely. */
+export function parseToolArgs(json: string): Record<string, unknown> {
+  try {
+    return JSON.parse(json) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}

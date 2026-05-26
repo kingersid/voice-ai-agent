@@ -1,0 +1,1 @@
+const http = require('http');\n\nconst server = http.createServer((req, res) => {\n  res.writeHead(200, {'Content-Type': 'text/plain'});\n  res.end('Hello World\\n');\n});\n\nserver.listen(3000, () => console.log('Server running on port 3000'))

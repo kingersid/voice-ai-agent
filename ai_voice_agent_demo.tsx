@@ -2,33 +2,46 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { MCPServer } from "./src/lib/mcp-server";
 import { MCPClient } from "./src/lib/mcp-client";
 import { InMemoryTransport } from "./src/lib/mcp-transport";
-import type { Tool, ToolCallResult } from "./src/lib/mcp-types";
+import type { Tool, ToolCallResult, JSONSchema } from "./src/lib/mcp-types";
+import { getToolResultText } from "./src/lib/mcp-types";
 
-// ─── MCP Initialization (runs once on import) ──────────────────────────────
-// The MCP server and client are created once and reused across renders.
+// ─── MCP Singleton (lazily initialized — no side effects on import) ────────
 
-const _clientTransport = new InMemoryTransport();
-const _serverTransport = new InMemoryTransport();
-InMemoryTransport.link(_clientTransport, _serverTransport);
-
-// Server instance — kept alive to serve tool calls; client used to query it
-const mcpServer = new MCPServer(_serverTransport);
-const mcpClient = new MCPClient(_clientTransport);
-// Keep server alive — constructor hooks into transport message handler
-void mcpServer;
-
-// Initialize the MCP connection immediately
-const initPromise = mcpClient.initialize().then(() => mcpClient.listTools());
-const toolsPromise = initPromise; // tools are fetched after init
-
-// ─── System Prompt (dynamically includes MCP tool descriptions) ────────────
-
+let _mcpClient: MCPClient | null = null;
+let _initPromise: Promise<Tool[]> | null = null;
 let _cachedTools: Tool[] = [];
-toolsPromise.then((tools) => { _cachedTools = tools; }).catch(() => {});
+
+function getMCPClient(): MCPClient {
+  if (!_mcpClient) {
+    const clientTransport = new InMemoryTransport();
+    const serverTransport = new InMemoryTransport();
+    InMemoryTransport.link(clientTransport, serverTransport);
+    // Server only needs to be created for its side effects (registers message handler)
+    new MCPServer(serverTransport);
+    _mcpClient = new MCPClient(clientTransport);
+  }
+  return _mcpClient;
+}
+
+function getMCPInitPromise(): Promise<Tool[]> {
+  if (!_initPromise) {
+    const client = getMCPClient();
+    _initPromise = client.initialize().then(() => client.listTools());
+    _initPromise.then((tools) => { _cachedTools = tools; }).catch(() => {});
+  }
+  return _initPromise;
+}
 
 function buildSystemPrompt(): string {
   return `You are Sid's concise voice assistant. Answer in 1-3 sentences. No introductions. Speak naturally.
-Use the provided tools whenever the query needs live data, personal notes, or the current time. Do not describe tool calls — just make them.`;
+
+Use tools ONLY for live data, personal notes, the current time, or ANY topic requiring external knowledge beyond your training (places, travel, geography, history, culture, recent events).
+
+For general chat, greetings, or questions you can confidently answer from memory, respond naturally and conversationally without referencing tools at all.
+
+If the user asks about a place, travel destination, city, country, or ANY factual question you're uncertain about, ALWAYS use the web_search tool to get accurate, current information.
+
+⚠️ CRITICAL: Never mention tools, tool calls, or tool usage in your response text. Never say "I don't need tools" or "no tools needed." Just answer as a normal assistant.`;
 }
 
 // ─── Build native tool definitions for the API ─────────────────────────
@@ -476,7 +489,7 @@ function McpConsole({ onClose }: { onClose: () => void }) {
   // Refresh tools on mount
   useEffect(() => {
     let cancelled = false;
-    initPromise
+    getMCPInitPromise()
       .then((ts) => {
         if (!cancelled) {
           setTools(ts);
@@ -487,7 +500,7 @@ function McpConsole({ onClose }: { onClose: () => void }) {
         if (!cancelled) {
           setStatus("error");
           // Still try to get tools
-          toolsPromise
+          getMCPInitPromise()
             .then((ts) => { if (!cancelled) { setTools(ts); setStatus("ready"); } })
             .catch(() => {});
         }
@@ -504,7 +517,8 @@ function McpConsole({ onClose }: { onClose: () => void }) {
       const toolDef = tools.find((t) => t.name === name);
       const toolPlaceholders = toolArgPlaceholders[name] ?? {};
       if (toolDef) {
-        const props = (toolDef.inputSchema as any)?.properties ?? {};
+        const schema = toolDef.inputSchema as JSONSchema;
+        const props = schema.properties ?? {};
         for (const key of Object.keys(props)) {
           // Use the same fallback chain as the input display: args > placeholder > ""
           const value = args[`${name}:${key}`] ?? toolPlaceholders[key] ?? "";
@@ -513,12 +527,9 @@ function McpConsole({ onClose }: { onClose: () => void }) {
           }
         }
       }
-      const res: ToolCallResult = await mcpClient.callTool(name, parsedArgs);
+      const res: ToolCallResult = await getMCPClient().callTool(name, parsedArgs);
       const elapsed = ((performance.now() - start) / 1000).toFixed(2);
-      const text = res.content
-        .filter((c) => c.type === "text")
-        .map((c) => (c as any).text)
-        .join("\n");
+      const text = getToolResultText(res);
       setResult({
         name,
         output: text || JSON.stringify(res, null, 2),
@@ -638,7 +649,8 @@ function McpConsole({ onClose }: { onClose: () => void }) {
             <div style={{ color: "#555", fontStyle: "italic" }}>Initializing...</div>
           ) : (
             tools.map((tool) => {
-              const props = (tool.inputSchema as any)?.properties ?? {};
+              const schema = tool.inputSchema as JSONSchema;
+              const props = schema.properties ?? {};
               const propKeys = Object.keys(props);
               const placeholders = toolArgPlaceholders[tool.name] ?? {};
               return (
@@ -804,7 +816,7 @@ function McpConsole({ onClose }: { onClose: () => void }) {
           flexShrink: 0,
         }}
       >
-        <span>MCP {mcpClient !== null ? "connected" : "disconnected"}</span>
+        <span>MCP CONNECTED</span>
         <span>All tools run via in-memory transport</span>
       </div>
     </div>
@@ -1015,7 +1027,7 @@ export default function AIVoiceAgentDemo() {
   const mcpReadyRef = useRef(false);
 
   useEffect(() => {
-    initPromise
+    getMCPInitPromise()
       .then(() => {
         mcpReadyRef.current = true;
         setMcpReady(true);
@@ -1313,14 +1325,22 @@ export default function AIVoiceAgentDemo() {
           body1.tool_choice = "auto";
         }
 
-        const res1 = await fetch("/api/nvidia/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${import.meta.env.VITE_NVIDIA_API_KEY}`,
-          },
-          body: JSON.stringify(body1),
-        });
+        const controller1 = new AbortController();
+        const timeout1 = setTimeout(() => controller1.abort(), 30_000);
+        let res1: Response;
+        try {
+          res1 = await fetch("/api/nvidia/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${import.meta.env.VITE_NVIDIA_API_KEY}`,
+            },
+            body: JSON.stringify(body1),
+            signal: controller1.signal,
+          });
+        } finally {
+          clearTimeout(timeout1);
+        }
 
         const data1 = await res1.json();
         if (!res1.ok) {
@@ -1353,11 +1373,8 @@ export default function AIVoiceAgentDemo() {
             setCallingTool(fnName);
             let textResult = "";
             try {
-              const result: ToolCallResult = await mcpClient.callTool(fnName, fnArgs);
-              textResult = result.content
-                .filter((c) => c.type === "text")
-                .map((c) => (c as { text: string }).text)
-                .join("\n");
+              const result: ToolCallResult = await getMCPClient().callTool(fnName, fnArgs);
+              textResult = getToolResultText(result);
             } catch (toolErr) {
               textResult = `Error calling ${fnName}: ${toolErr instanceof Error ? toolErr.message : String(toolErr)}`;
             }
@@ -1368,13 +1385,17 @@ export default function AIVoiceAgentDemo() {
           setCallingTool(null);
 
           // ── Step 3: Send tool results back for final answer ────────────
-          const res2 = await fetch("/api/nvidia/v1/chat/completions", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${import.meta.env.VITE_NVIDIA_API_KEY}`,
-            },
-            body: JSON.stringify({
+          const controller2 = new AbortController();
+          const timeout2 = setTimeout(() => controller2.abort(), 15_000);
+          let res2: Response;
+          try {
+            res2 = await fetch("/api/nvidia/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${import.meta.env.VITE_NVIDIA_API_KEY}`,
+              },
+              body: JSON.stringify({
               model: "meta/llama-3.1-70b-instruct",
               max_tokens: 300,
               temperature: 0.5,
@@ -1382,15 +1403,19 @@ export default function AIVoiceAgentDemo() {
                 {
                   role: "system",
                   content:
-                    "You are Sid's concise voice assistant. Answer in 1-3 sentences. No bullet points. Be direct and natural.",
+                    "You are Sid's concise voice assistant. Answer in 1-3 sentences. No bullet points. Be direct and natural. Never mention tools or tool calls in your response.",
                 },
                 ...history,
                 { role: "user", content: text },
                 message,
                 ...toolResultMessages,
               ],
+              signal: controller2.signal,
             }),
           });
+        } finally {
+          clearTimeout(timeout2);
+        }
 
           const data2 = await res2.json();
           if (!res2.ok) {

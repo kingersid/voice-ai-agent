@@ -23,6 +23,12 @@ export default defineConfig({
         target: "http://localhost:3001",
         changeOrigin: true,
       },
+      "/api/obsidian": {
+        target: "https://127.0.0.1:27124",
+        changeOrigin: true,
+        secure: false,
+        rewrite: (path) => path.replace(/^\/api\/obsidian/, ""),
+      },
     },
   },
 });

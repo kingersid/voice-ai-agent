@@ -150,8 +150,7 @@ app.post("/api/exec/write-file", (req, res) => {
   }
 
   // Sanitize: prevent path traversal outside the project directory
-  const sanitized = path.normalize(filePath).replace(/^(\..|\/|\\|~)/, "");
-  const fullPath = path.resolve(process.cwd(), sanitized || filePath);
+  const fullPath = path.resolve(process.cwd(), path.normalize(filePath));
   const projectRoot = path.resolve(process.cwd());
 
   if (!fullPath.startsWith(projectRoot)) {

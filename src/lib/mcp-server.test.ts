@@ -1,8 +1,13 @@
 // ─── MCP Server Tests: write_file & execute_command ────────────────────────
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { MCPServer } from "./mcp-server";
+import { describe, it, expect, beforeEach, afterEach, vi, beforeAll } from "vitest";
+import { MCPServer, setTavilyRateLimit } from "./mcp-server";
 import { InMemoryTransport } from "./mcp-transport";
 import type { ToolCallResult } from "./mcp-types";
+
+// Disable the Tavily rate limiter in tests so they don't incur 3s delays
+beforeAll(() => {
+  setTavilyRateLimit(0);
+});
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -360,7 +365,7 @@ describe("read_note tool", () => {
 
     expect(result.isError).toBe(true);
     const text = (result.content[0] as any).text;
-    expect(text).toContain("Note not found: nonexistent.md");
+    expect(text).toContain("Note not found in Obsidian or cache: nonexistent.md");
     expect(text).toContain("Available notes:");
   });
 
@@ -380,7 +385,7 @@ describe("read_note tool", () => {
 
     expect(result.isError).toBe(true);
     const text = (result.content[0] as any).text;
-    expect(text).toContain("Note not found:");
+    expect(text).toContain("Note not found in Obsidian or cache:");
     expect(text).toContain("Available notes:");
   });
 
@@ -562,11 +567,9 @@ describe("web_search tool", () => {
     // Verify fetch was called with correct URL and body
     expect(fetch).toHaveBeenCalledWith("/api/tavily/search", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer test-tavily-key",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        api_key: "test-tavily-key",
         query: "IPL 2025 news",
         search_depth: "basic",
         max_results: 5,
@@ -687,7 +690,7 @@ describe("save_note tool", () => {
     });
 
     expect(result.isError).toBeFalsy();
-    expect((result.content[0] as any).text).toContain("Note saved: wiki/test-note.md");
+    expect((result.content[0] as any).text).toContain("Note saved to Obsidian vault: wiki/test-note.md");
 
     // Verify fetch was called to persist to GitHub
     expect(fetch).toHaveBeenCalledWith("/api/vault/save", {
@@ -762,7 +765,7 @@ describe("save_note tool", () => {
 
     // Should still return success for in-memory save
     expect(result.isError).toBeFalsy();
-    expect((result.content[0] as any).text).toContain("Note saved: wiki/offline-note.md");
+    expect((result.content[0] as any).text).toContain("Note cached in-memory: wiki/offline-note.md");
 
     // The note should be readable from in-memory vault
     const readResult: ToolCallResult = await server.callTool("read_note", {
@@ -786,7 +789,7 @@ describe("save_note tool", () => {
 
     // Should still return success for in-memory save
     expect(result.isError).toBeFalsy();
-    expect((result.content[0] as any).text).toContain("Note saved: wiki/error-note.md");
+    expect((result.content[0] as any).text).toContain("Note cached in-memory: wiki/error-note.md");
 
     // The note should be readable from in-memory vault
     const readResult: ToolCallResult = await server.callTool("read_note", {
