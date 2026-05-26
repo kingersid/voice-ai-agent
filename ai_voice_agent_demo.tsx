@@ -28,13 +28,7 @@ toolsPromise.then((tools) => { _cachedTools = tools; }).catch(() => {});
 
 function buildSystemPrompt(): string {
   return `You are Sid's concise voice assistant. Answer in 1-3 sentences. No introductions. Speak naturally.
-
-RULES:
-- NEWS / CURRENT EVENTS / WEATHER / SPORTS / STOCKS / PRICES → use web_search
-- Read personal notes (investments, goals, routine) → read_note or search_vault
-- Current date/time → get_time
-- To SAVE or CREATE a new note → save_note with "filename" and "content"
-- For writing files or running terminal commands → write_file or execute_command`;
+Use the provided tools whenever the query needs live data, personal notes, or the current time. Do not describe tool calls — just make them.`;
 }
 
 // ─── Build native tool definitions for the API ─────────────────────────
@@ -113,75 +107,7 @@ interface ChatMessage {
 
 type VoiceStatus = "idle" | "listening" | "processing" | "speaking";
 
-// ─── Tool Call Parsing ─────────────────────────────────────────────────────
-
-interface ParsedToolCall {
-  name: string;
-  args: Record<string, unknown>;
-}
-
-function parseToolCalls(text: string): ParsedToolCall[] {
-  const calls: ParsedToolCall[] = [];
-  // Normalize: strip backtick code blocks around tool calls, accept lowercase tool:
-  // Replace tool: with TOOL: for case-insensitive matching
-  const normalized = text
-    .replace(/```[\s\S]*?```/g, "")        // Strip fenced code blocks first
-    .replace(/`(TOOL\s*:|tool\s*:)/gi, "$1") // Un-backtick TOOL: / tool:
-    .replace(/`/g, "");                       // Remove any remaining backticks
-
-  // Balanced-brace parser: find TOOL: name( ... ) where parens are balanced, case-insensitive
-  const toolStartRegex = /TOOL:\s*(\w+)\s*\(/gi;
-  let match: RegExpExecArray | null;
-  while ((match = toolStartRegex.exec(normalized)) !== null) {
-    const name = match[1];
-    const start = match.index + match[0].length;
-    // Find the matching closing paren by tracking depth
-    let depth = 1;
-    let pos = start;
-    while (pos < normalized.length && depth > 0) {
-      if (normalized[pos] === "(") depth++;
-      if (normalized[pos] === ")") depth--;
-      pos++;
-    }
-    const argsStr = normalized.slice(start, pos - 1).trim();
-    try {
-      // Try standard JSON first
-      const args = argsStr ? JSON.parse(argsStr) : {};
-      calls.push({ name, args });
-    } catch {
-      // If JSON parse fails, try replacing single quotes with double quotes
-      try {
-        const fixed = argsStr.replace(/'/g, '"');
-        const args = JSON.parse(fixed);
-        calls.push({ name, args });
-      } catch {
-        // Last resort: try to extract ALL key-value pairs from malformed input
-        const kvPairs: Record<string, string> = {};
-        const kvRegex = /(\w+)\s*[:=]\s*["']?([^"'\s,)}]+)["']?/g;
-        let kvMatch: RegExpExecArray | null;
-        while ((kvMatch = kvRegex.exec(argsStr)) !== null) {
-          kvPairs[kvMatch[1]] = kvMatch[2];
-        }
-        if (Object.keys(kvPairs).length > 0) {
-          calls.push({ name, args: kvPairs as unknown as Record<string, unknown> });
-        } else {
-          calls.push({ name, args: {} });
-        }
-      }
-    }
-  }
-  return calls;
-}
-
-function stripToolCalls(text: string): string {
-  // Remove TOOL: name(...) patterns with balanced-paren matching, case-insensitive
-  // First normalize backtick-wrapped tool calls
-  const normalized = text
-    .replace(/```[\s\S]*?```/g, "")
-    .replace(/`(TOOL\s*:|tool\s*:)/gi, "$1")
-    .replace(/`/g, "");
-  return normalized.replace(/TOOL:\s*\w+\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)\s*/gi, "").trim();
-}
+// (text-based tool call parsing removed — using native tool_calls only)
 
 // ─── HUD Waveform (continuous, sci-fi style) ────────────────────────────────
 
@@ -1096,7 +1022,7 @@ export default function AIVoiceAgentDemo() {
       })
       .catch((err) => {
         console.error("MCP init failed:", err);
-        // Still mark as ready — the system prompt will just have no tools
+        // Mark ready even on failure — queryAI will run without tools
         mcpReadyRef.current = true;
         setMcpReady(true);
       });
@@ -1344,10 +1270,9 @@ export default function AIVoiceAgentDemo() {
     async (text: string, _isVoiceInput: boolean) => {
       if (!text.trim() || pendingRef.current) return;
 
-      // Wait for MCP to initialize if not ready
+      // Wait up to 2s for MCP to initialise; then proceed (tools may be empty)
       if (!mcpReadyRef.current) {
-        await new Promise((r) => setTimeout(r, 500));
-        if (!mcpReadyRef.current) return;
+        await new Promise((r) => setTimeout(r, 2000));
       }
 
       pendingRef.current = true;
@@ -1368,28 +1293,33 @@ export default function AIVoiceAgentDemo() {
           content: m.text,
         }));
 
-        // ── Step 1: Send to LLM with tool descriptions ───────────────
         const systemPrompt = buildSystemPrompt();
         const toolsForAPI = buildToolsForAPI();
+
+        // ── Step 1: LLM call with native tool definitions ──────────────
+        const body1: Record<string, unknown> = {
+          model: "meta/llama-3.1-70b-instruct",
+          max_tokens: 800,
+          temperature: 0.5,
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...history,
+            { role: "user", content: text },
+          ],
+        };
+        // Only attach tools if MCP gave us some
+        if (toolsForAPI.length > 0) {
+          body1.tools = toolsForAPI;
+          body1.tool_choice = "auto";
+        }
 
         const res1 = await fetch("/api/nvidia/v1/chat/completions", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-          Authorization: `Bearer ${import.meta.env.VITE_NVIDIA_API_KEY}`,
+            Authorization: `Bearer ${import.meta.env.VITE_NVIDIA_API_KEY}`,
           },
-          body: JSON.stringify({
-            model: "mistralai/mistral-large-3-675b-instruct-2512",
-            max_tokens: 800,
-            temperature: 0.5,
-            messages: [
-              { role: "system", content: systemPrompt },
-              ...history,
-              { role: "user", content: text },
-            ],
-            tools: toolsForAPI,
-            tool_choice: "auto",
-          }),
+          body: JSON.stringify(body1),
         });
 
         const data1 = await res1.json();
@@ -1398,13 +1328,16 @@ export default function AIVoiceAgentDemo() {
         }
 
         const message = data1.choices?.[0]?.message;
-        let reply = message?.content || "";
-        const nativeToolCalls = message?.tool_calls;
-        let toolsUsed: { name: string; args: Record<string, unknown> }[] = [];
+        let reply: string = message?.content ?? "";
+        const nativeToolCalls: Array<{
+          id: string;
+          type: string;
+          function: { name: string; arguments: string };
+        }> = message?.tool_calls ?? [];
+        const toolsUsed: { name: string; args: Record<string, unknown> }[] = [];
 
-        // ── Step 2: Execute native tool calls (if any) ──────────────
-        if (nativeToolCalls && nativeToolCalls.length > 0) {
-          setVoiceStatus("processing");
+        // ── Step 2: Execute native tool calls (single path, no text fallback) ──
+        if (nativeToolCalls.length > 0) {
           const toolResultMessages: Array<{ role: string; tool_call_id: string; content: string }> = [];
 
           for (const tc of nativeToolCalls) {
@@ -1418,22 +1351,23 @@ export default function AIVoiceAgentDemo() {
             }
 
             setCallingTool(fnName);
-            const result: ToolCallResult = await mcpClient.callTool(fnName, fnArgs);
-            const textResult = result.content
-              .filter((c) => c.type === "text")
-              .map((c) => (c as any).text)
-              .join("\n");
+            let textResult = "";
+            try {
+              const result: ToolCallResult = await mcpClient.callTool(fnName, fnArgs);
+              textResult = result.content
+                .filter((c) => c.type === "text")
+                .map((c) => (c as { text: string }).text)
+                .join("\n");
+            } catch (toolErr) {
+              textResult = `Error calling ${fnName}: ${toolErr instanceof Error ? toolErr.message : String(toolErr)}`;
+            }
 
-            toolResultMessages.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: textResult,
-            });
+            toolResultMessages.push({ role: "tool", tool_call_id: tc.id, content: textResult });
             toolsUsed.push({ name: fnName, args: fnArgs });
           }
           setCallingTool(null);
 
-          // ── Step 3: Send tool results to LLM for final answer ──────
+          // ── Step 3: Send tool results back for final answer ────────────
           const res2 = await fetch("/api/nvidia/v1/chat/completions", {
             method: "POST",
             headers: {
@@ -1441,18 +1375,17 @@ export default function AIVoiceAgentDemo() {
               Authorization: `Bearer ${import.meta.env.VITE_NVIDIA_API_KEY}`,
             },
             body: JSON.stringify({
-              model: "mistralai/mistral-large-3-675b-instruct-2512",
+              model: "meta/llama-3.1-70b-instruct",
               max_tokens: 300,
               temperature: 0.5,
               messages: [
                 {
                   role: "system",
                   content:
-                    "You are Sid's concise voice assistant. Answer in 1-3 sentences. No introductions. No bullet points. Be direct and natural.",
+                    "You are Sid's concise voice assistant. Answer in 1-3 sentences. No bullet points. Be direct and natural.",
                 },
                 ...history,
                 { role: "user", content: text },
-                // Pass the assistant message WITH tool_calls so the API knows which tool results correspond
                 message,
                 ...toolResultMessages,
               ],
@@ -1461,71 +1394,13 @@ export default function AIVoiceAgentDemo() {
 
           const data2 = await res2.json();
           if (!res2.ok) {
-            const errDetail = data2.error?.message || JSON.stringify(data2.error) || `API error: ${res2.status}`;
-            console.error("[NVIDIA 2nd call] Returned", res2.status, ":", data2);
-            throw new Error(errDetail);
+            throw new Error(data2.error?.message || `API error: ${res2.status}`);
           }
-          reply = data2.choices?.[0]?.message?.content || reply;
+          reply = data2.choices?.[0]?.message?.content ?? reply;
         }
 
-        // Fallback: text-based tool call parsing for models that don't support native tool calling
-        if ((!nativeToolCalls || nativeToolCalls.length === 0) && !toolsUsed.length) {
-          const textToolCalls = parseToolCalls(reply);
-          if (textToolCalls.length > 0) {
-            setVoiceStatus("processing");
-            const toolResults: string[] = [];
-            for (const tc of textToolCalls) {
-              setCallingTool(tc.name);
-              const result: ToolCallResult = await mcpClient.callTool(tc.name, tc.args);
-              const textResult = result.content
-                .filter((c) => c.type === "text")
-                .map((c) => (c as any).text)
-                .join("\n");
-              toolResults.push(`[${tc.name}] ${textResult}`);
-              toolsUsed.push(tc);
-            }
-            setCallingTool(null);
-
-            const toolContext = toolResults.join("\n\n");
-            const res2 = await fetch("/api/nvidia/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${import.meta.env.VITE_NVIDIA_API_KEY}`,
-              },
-              body: JSON.stringify({
-                model: "mistralai/mistral-large-3-675b-instruct-2512",
-                max_tokens: 300,
-                temperature: 0.5,
-                messages: [
-                  {
-                    role: "system",
-                    content:
-                      "You are Sid's concise voice assistant. Answer in 1-3 sentences. No introductions. No bullet points. Be direct and natural.",
-                  },
-                  ...history,
-                  { role: "user", content: text },
-                  { role: "assistant", content: stripToolCalls(reply) },
-                  {
-                    role: "user",
-                    content: `Tool results:\n${toolContext}\n\nUse the above data to answer Sid's original question. Be concise.`,
-                  },
-                ],
-              }),
-            });
-
-            const data2 = await res2.json();
-            if (!res2.ok) {
-              const errDetail = data2.error?.message || JSON.stringify(data2.error) || `API error: ${res2.status}`;
-              console.error("[NVIDIA 2nd call] Returned", res2.status, ":", data2);
-              throw new Error(errDetail);
-            }
-            reply = data2.choices?.[0]?.message?.content || reply;
-          }
-        }
-
-        // Final cleanup of any leftover text-based tool call markers
-        reply = stripToolCalls(reply) || "Got it.";
+        // Trim any accidental leading/trailing whitespace
+        reply = reply.trim() || "Got it.";
 
         const assistantMsg: ChatMessage = {
           role: "assistant",
@@ -1548,8 +1423,8 @@ export default function AIVoiceAgentDemo() {
       } catch (err) {
         const errorText =
           err instanceof Error
-            ? `API error: ${err.message}`
-            : "Connection error. Are you offline? Check your network and try again.";
+            ? `Error: ${err.message}`
+            : "Connection error. Are you offline?";
         const fallbackMsg: ChatMessage = {
           role: "assistant",
           text: errorText,
@@ -2336,7 +2211,7 @@ export default function AIVoiceAgentDemo() {
           background: "#050a07",
         }}
       >
-        <span>MY VAULT · 7 TOOLS · MISTRAL LARGE 3 VIA NVIDIA</span>
+        <span>MY VAULT · 7 TOOLS · LLAMA 3.1 70B VIA NVIDIA</span>
         <span aria-live="polite">
           {voiceStatus === "listening"
             ? "▲ RECV"

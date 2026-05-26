@@ -263,38 +263,7 @@ export default function SecondBrainDemo() {
     setNewMsgIdx(0);
   }, []);
 
-  const detectTools = (userMsg) => {
-    const msg = userMsg.toLowerCase();
-    const tools = [];
-    if (msg.includes("invest") || msg.includes("igil") || msg.includes("stock") || msg.includes("money")) {
-      tools.push({ name: "read_note", args: '"wiki/my-investments.md"' });
-    }
-    if (msg.includes("goal") || msg.includes("dream") || msg.includes("aspir") || msg.includes("plan")) {
-      tools.push({ name: "read_note", args: '"wiki/personal-goals-aspirations.md"' });
-    }
-    if (msg.includes("meditat") || msg.includes("thursday") || msg.includes("archana")) {
-      tools.push({ name: "read_note", args: '"wiki/meditation-sessions.md"' });
-    }
-    if (msg.includes("routine") || msg.includes("walk") || msg.includes("daily")) {
-      tools.push({ name: "read_note", args: '"daily/routine.md"' });
-    }
-    if (msg.includes("professional") || msg.includes("career") || msg.includes("growth") || msg.includes("teach")) {
-      tools.push({ name: "read_note", args: '"wiki/professional-growth-plan.md"' });
-    }
-    if (msg.includes("remarkable") || msg.includes("about me") || msg.includes("who am i")) {
-      tools.push({ name: "search_vault", args: '"sid identity"' });
-    }
-    if (msg.includes("time") || msg.includes("today") || msg.includes("date")) {
-      tools.push({ name: "get_time", args: "" });
-    }
-    if (msg.includes("weather") || msg.includes("news") || msg.includes("current") || msg.includes("latest")) {
-      tools.push({ name: "web_search", args: `"${userMsg.slice(0, 30)}"` });
-    }
-    if (tools.length === 0 && msg.length > 5) {
-      tools.push({ name: "search_vault", args: `"${userMsg.slice(0, 20)}"` });
-    }
-    return tools;
-  };
+  // Tool detection removed — vault is already embedded in the system prompt.
 
   const sendMessage = async (text) => {
     if (!text.trim() || loading) return;
@@ -310,7 +279,6 @@ export default function SecondBrainDemo() {
     setLoading(true);
 
     try {
-      const tools = detectTools(text);
       const history = messages.map(m => ({
         role: m.role,
         content: m.text
@@ -323,7 +291,7 @@ export default function SecondBrainDemo() {
           Authorization: `Bearer ${import.meta.env.VITE_NVIDIA_API_KEY}`,
         },
         body: JSON.stringify({
-          model: "mistralai/mistral-7b-instruct-v0.3",
+          model: "meta/llama-3.1-70b-instruct",
           max_tokens: 1000,
           temperature: 0.5,
           messages: [
@@ -343,7 +311,7 @@ export default function SecondBrainDemo() {
       const assistantMsg = {
         role: "assistant",
         text: reply,
-        tools,
+        tools: [],
         time: new Date().toLocaleTimeString("en", { hour: "2-digit", minute: "2-digit" })
       };
 
@@ -353,7 +321,7 @@ export default function SecondBrainDemo() {
       });
     } catch (err) {
       const errorText = err instanceof Error
-        ? `API error: ${err.message}`
+        ? `Error: ${err.message}`
         : "Connection error. Are you offline?";
       setMessages(prev => {
         setNewMsgIdx(prev.length);
@@ -411,7 +379,7 @@ export default function SecondBrainDemo() {
               SECOND BRAIN
             </div>
             <div style={{ fontSize: 10, color: "#2d5a3d", letterSpacing: "0.1em" }}>
-              SID'S VAULT · CLAUDE SONNET 4
+              SID'S VAULT · LLAMA 3.1 70B
             </div>
           </div>
         </div>
@@ -505,7 +473,7 @@ export default function SecondBrainDemo() {
           </button>
         </div>
         <div style={{ fontSize: 10, color: "#1a3322", textAlign: "center", marginTop: 8 }}>
-          Vault loaded · 7 notes · Mistral 7B via NVIDIA
+          Vault loaded · 7 notes · Llama 3.1 70B via NVIDIA
         </div>
       </div>
     </div>
