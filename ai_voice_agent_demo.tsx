@@ -57,6 +57,8 @@ For questions needing information, use tools as needed. You can call multiple to
 
 ⚠️ FILE CREATION RULE: When the user asks you to CREATE, WRITE, or BUILD a file (code, HTML, CSS, JS, a game, etc.), you MUST use the write_file tool to write it to disk. Do NOT output the file contents in your chat response — just use write_file, then briefly inform the user what was created.
 
+IMPORTANT: The write_file tool's 'content' parameter must contain the COMPLETE file content in a single call — do not split file content across multiple tool calls or iterations. Generate the full file at once.
+
 For COMPLEX TASKS (coding, file operations, multi-step research), work through them methodically:
 1. Break the task into logical steps
 2. Call tools to accomplish each step
@@ -160,7 +162,118 @@ interface ChatMessage {
 
 type VoiceStatus = "idle" | "listening" | "processing" | "speaking";
 
-// (text-based tool call parsing removed — using native tool_calls only)
+// ─── Text-to-tool-call fallback parser ──────────────────────────────────
+// Llama 3.1 70B sometimes ignores tool_choice and outputs tool calls as
+// JSON text in the content field instead of using the structured tool_calls
+// response key. This parser detects those text-encoded tool calls and
+// normalizes them so the ReAct loop can execute them.
+
+function parseTextToolCalls(content: string): Array<{
+  id: string;
+  type: string;
+  function: { name: string; arguments: string };
+}> | null {
+  if (!content) return null;
+
+  const results: Array<{
+    id: string;
+    type: string;
+    function: { name: string; arguments: string };
+  }> = [];
+
+  // Strip markdown code fences (```json ... ```)
+  const cleaned = content.replace(/```(?:json)?\s*\n?/g, "");
+
+  // Helper: extract tool call names/args from a parsed JSON object
+  function extractToolCall(obj: Record<string, unknown>): { name: string; argsStr: string } | null {
+    const name = (obj.name || obj.function) as string | undefined;
+    const args = obj.arguments || obj.params || obj.parameters;
+    if (name && typeof name === "string" && args) {
+      return {
+        name,
+        argsStr: typeof args === "string" ? args : JSON.stringify(args),
+      };
+    }
+    return null;
+  }
+
+  // Try to find a JSON array at the start or in code blocks
+  // Pattern: [{"name": "tool_a", ...}, {"name": "tool_b", ...}]
+  const trimmed = cleaned.trim();
+  if (trimmed.startsWith("[")) {
+    // Find matching closing bracket
+    let arrayDepth = 0;
+    for (let i = 0; i < trimmed.length; i++) {
+      if (trimmed[i] === "[") arrayDepth++;
+      if (trimmed[i] === "]") arrayDepth--;
+      if (arrayDepth === 0 && i > 0) {
+        const candidate = trimmed.slice(0, i + 1);
+        try {
+          const arr = JSON.parse(candidate);
+          if (Array.isArray(arr)) {
+            for (const item of arr) {
+              const tc = extractToolCall(item as Record<string, unknown>);
+              if (tc) {
+                results.push({
+                  id: `text-fallback-${tc.name}-${results.length}`,
+                  type: "function",
+                  function: { name: tc.name, arguments: tc.argsStr },
+                });
+              }
+            }
+          }
+        } catch {
+          // Not a valid JSON array, fall through to object scanning
+        }
+        break;
+      }
+    }
+  }
+
+  // If no array matches, walk through text for individual { } JSON objects
+  if (results.length === 0) {
+    let depth = 0;
+    let start = -1;
+    let inString = false;
+    for (let i = 0; i < cleaned.length; i++) {
+      const ch = cleaned[i];
+      const prev = i > 0 ? cleaned[i - 1] : "";
+
+      // Toggle string state on unescaped quotes (skip braces inside strings)
+      if (ch === '"' && prev !== "\\") {
+        inString = !inString;
+      }
+
+      if (!inString) {
+        if (ch === "{") {
+          if (depth === 0) start = i;
+          depth++;
+        } else if (ch === "}") {
+          depth--;
+          if (depth === 0 && start >= 0) {
+            const candidate = cleaned.slice(start, i + 1);
+            try {
+              const parsed = JSON.parse(candidate);
+              const tc = extractToolCall(parsed as Record<string, unknown>);
+              if (tc) {
+                results.push({
+                  id: `text-fallback-${tc.name}-${results.length}`,
+                  type: "function",
+                  function: { name: tc.name, arguments: tc.argsStr },
+                });
+              }
+            } catch {
+              // Not valid JSON at this boundary, keep scanning
+            }
+            start = -1;
+          }
+        }
+      }
+    }
+  }
+
+  return results.length > 0 ? results : null;
+}
 
 // ─── HUD Waveform (continuous, sci-fi style) ────────────────────────────────
 
@@ -1371,10 +1484,13 @@ export default function AIVoiceAgentDemo() {
       setVoiceStatus("processing");
 
       try {
-        const history = messagesRef.current.map((m) => ({
-          role: m.role as "user" | "assistant",
-          content: m.text,
-        }));
+        // ── Sliding window: keep last 10 history messages ─────────────
+        const history = messagesRef.current
+          .slice(-10)
+          .map((m) => ({
+            role: m.role as "user" | "assistant",
+            content: m.text,
+          }));
 
         // ── Retrieve relevant past memories ─────────────────────────
         const relevantMemories = searchMemories(text, 5);
@@ -1395,12 +1511,19 @@ export default function AIVoiceAgentDemo() {
         let iter = 0;
 
         // ── ReAct Loop: call LLM + execute tools until we get a text answer ──
+        // ── Track seen tool signatures across all iterations to detect loops ──
+        const seenToolSignatures = new Set<string>();
+
         for (; iter < MAX_ITERATIONS; iter++) {
           setIteration(iter + 1);
 
+          // ── Inject iteration budget into system prompt ─────────────
+          (messages[0] as Record<string, unknown>).content =
+            `${systemPrompt}\n\n⚠️ BUDGET: Step ${iter + 1}/${MAX_ITERATIONS}. Be efficient and avoid repeating tool calls.`;
+
           const body: Record<string, unknown> = {
             model: "meta/llama-3.1-70b-instruct",
-            max_tokens: 800,
+            max_tokens: 4096,
             temperature: 0.5,
             messages,
           };
@@ -1433,13 +1556,34 @@ export default function AIVoiceAgentDemo() {
 
           const choice = data.choices?.[0]?.message;
           const content = choice?.content ?? "";
-          const toolCalls: Array<{
+          let toolCalls: Array<{
             id: string;
             type: string;
             function: { name: string; arguments: string };
           }> = choice?.tool_calls ?? [];
 
-          // No tool calls → this is the final answer
+          // ── Fallback: Llama sometimes outputs tool calls as text JSON ──
+          if (toolCalls.length === 0) {
+            const textToolCalls = parseTextToolCalls(content);
+            if (textToolCalls && textToolCalls.length > 0) {
+              toolCalls = textToolCalls;
+            }
+          }
+
+          // ── Duplicate tool call detection ────────────────────────
+          const signature = toolCalls
+            .filter((tc) => tc.type === "function")
+            .map((tc) => `${tc.function.name}(${tc.function.arguments})`)
+            .sort()
+            .join("|");
+          if (signature && seenToolSignatures.has(signature)) {
+            // Already seen this exact set of tool calls — model is looping
+            finalReply = "I've completed the steps I can. Let me know if you need a different approach.";
+            break;
+          }
+          if (signature) seenToolSignatures.add(signature);
+
+          // ── No tool calls at all → final answer ──
           if (toolCalls.length === 0) {
             finalReply = content;
             break;
@@ -1461,11 +1605,23 @@ export default function AIVoiceAgentDemo() {
 
             setCallingTool(fnName);
             let textResult = "";
-            try {
-              const result: ToolCallResult = await getMCPClient().callTool(fnName, fnArgs);
-              textResult = getToolResultText(result);
-            } catch (toolErr) {
-              textResult = `Error calling ${fnName}: ${toolErr instanceof Error ? toolErr.message : String(toolErr)}`;
+            // ── Retry tool calls once with exponential backoff ──────
+            let lastToolError: Error | null = null;
+            for (let retry = 0; retry < 2; retry++) {
+              try {
+                const result: ToolCallResult = await getMCPClient().callTool(fnName, fnArgs);
+                textResult = getToolResultText(result);
+                lastToolError = null;
+                break;
+              } catch (toolErr) {
+                lastToolError = toolErr instanceof Error ? toolErr : new Error(String(toolErr));
+                if (retry < 1) {
+                  await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
+                }
+              }
+            }
+            if (lastToolError) {
+              textResult = `Error calling ${fnName} after 2 attempts: ${lastToolError.message}`;
             }
 
             messages.push({ role: "tool", tool_call_id: tc.id, content: textResult });
