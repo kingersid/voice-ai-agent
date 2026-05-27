@@ -24,9 +24,8 @@ export default defineConfig({
         changeOrigin: true,
       },
       "/api/obsidian": {
-        target: "https://127.0.0.1:27124",
+        target: "http://127.0.0.1:27123",
         changeOrigin: true,
-        secure: false,
         rewrite: (path) => path.replace(/^\/api\/obsidian/, ""),
       },
     },

@@ -18,6 +18,7 @@ import {
 } from "./mcp-types";
 import type { InMemoryTransport } from "./mcp-transport";
 import * as obsidian from "./obsidian-client";
+import { searchMemories, formatMemoriesForPrompt } from "./memory-store";
 
 // ─── Tavily Rate Limiter ─────────────────────────────────────────────────────
 // Tavily free tier typically allows ~1 request/sec burst and ~1000 req/month.
@@ -230,6 +231,21 @@ const TOOLS: Tool[] = [
       required: [],
     },
   },
+  {
+    name: "search_memory",
+    title: "Search Past Memories",
+    description: "Search through past conversations and interactions stored in your persistent memory. Use this to recall what was discussed earlier, what tools were used, and what actions were taken. Searches by keyword across all saved memories.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "The search query to find relevant memories",
+        },
+      },
+      required: ["query"],
+    },
+  },
 ];
 
 // ─── MCP Server ────────────────────────────────────────────────────────────
@@ -271,6 +287,8 @@ export class MCPServer {
         return await this.handleGetActiveFile();
       case "get_daily_note":
         return await this.handleGetDailyNote();
+      case "search_memory":
+        return await this.handleSearchMemory(args);
       default:
         return {
           content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -444,13 +462,11 @@ export class MCPServer {
     }
 
     const limited = result.results.slice(0, 3);
-    const lines = await Promise.all(
-      limited.map(async (r, i) => {
-        const full = await obsidian.readVaultFile(r.path);
-        const snippet = full.ok ? full.content.slice(0, 300) : (r.match ?? "");
-        return `${i + 1}. [${r.path}]\n   ${snippet}`;
-      }),
-    );
+    // Use match snippet from search response — no extra fetch per result
+    const lines = limited.map((r, i) => {
+      const snippet = (r.match ?? "").slice(0, 300);
+      return `${i + 1}. [${r.path}]\n   ${snippet}`;
+    });
 
     return {
       content: [{ type: "text", text: `Search results for "${query}" in Obsidian vault:\n\n${lines.join("\n\n---\n\n")}` }],
@@ -722,6 +738,28 @@ export class MCPServer {
 
     return {
       content: [{ type: "text", text: `📍 Active file: ${active.path}\n\n${content.content}` }],
+    };
+  }
+
+  private async handleSearchMemory(args: Record<string, unknown>): Promise<ToolCallResult> {
+    const query = String(args.query ?? "").trim();
+    if (!query) {
+      return {
+        content: [{ type: "text", text: "Please provide a search query." }],
+        isError: true,
+      };
+    }
+
+    const results = searchMemories(query, 8);
+    if (results.length === 0) {
+      return {
+        content: [{ type: "text", text: `No memories found for "${query}".` }],
+      };
+    }
+
+    const formatted = formatMemoriesForPrompt(results);
+    return {
+      content: [{ type: "text", text: `Found ${results.length} relevant memory/ies for "${query}":\n${formatted}` }],
     };
   }
 

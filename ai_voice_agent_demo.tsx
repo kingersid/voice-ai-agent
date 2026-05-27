@@ -4,6 +4,15 @@ import { MCPClient } from "./src/lib/mcp-client";
 import { InMemoryTransport } from "./src/lib/mcp-transport";
 import type { Tool, ToolCallResult, JSONSchema } from "./src/lib/mcp-types";
 import { getToolResultText } from "./src/lib/mcp-types";
+import { checkObsidianStatus } from "./src/lib/obsidian-client";
+import {
+  getMemories,
+  searchMemories,
+  saveMemory,
+  clearMemories,
+  formatMemoriesForPrompt,
+  summarizeInteraction,
+} from "./src/lib/memory-store";
 
 // ─── MCP Singleton (lazily initialized — no side effects on import) ────────
 
@@ -32,16 +41,30 @@ function getMCPInitPromise(): Promise<Tool[]> {
   return _initPromise;
 }
 
-function buildSystemPrompt(): string {
-  return `You are Sid's concise voice assistant. Answer in 1-3 sentences. No introductions. Speak naturally.
+function buildSystemPrompt(memoryContext?: string): string {
+  let prompt = `You are Sid's voice assistant. Be natural and direct. No introductions.
 
-Use tools ONLY for live data, personal notes, the current time, or ANY topic requiring external knowledge beyond your training (places, travel, geography, history, culture, recent events).
+`;
 
-For general chat, greetings, or questions you can confidently answer from memory, respond naturally and conversationally without referencing tools at all.
+  // Inject relevant past memories if available
+  if (memoryContext) {
+    prompt += `${memoryContext}\n\n`;
+  }
+
+  prompt += `For simple questions (greetings, opinions, general chat), answer directly from your knowledge without using tools.
+
+For questions needing information, use tools as needed. You can call multiple tools in sequence — each tool call result will be provided back to you so you can keep working through a task step by step.
+
+⚠️ FILE CREATION RULE: When the user asks you to CREATE, WRITE, or BUILD a file (code, HTML, CSS, JS, a game, etc.), you MUST use the write_file tool to write it to disk. Do NOT output the file contents in your chat response — just use write_file, then briefly inform the user what was created.
+
+For COMPLEX TASKS (coding, file operations, multi-step research), work through them methodically:
+1. Break the task into logical steps
+2. Call tools to accomplish each step
+3. When the task is fully complete, provide a clear summary as your final answer
 
 If the user asks about a place, travel destination, city, country, or ANY factual question you're uncertain about, ALWAYS use the web_search tool to get accurate, current information.
 
-⚠️ CRITICAL: Never mention tools, tool calls, or tool usage in your response text unless the user directly asks what tools you have. Never say "I don't need tools" or "no tools needed." Just answer as a normal assistant.
+⚠️ CRITICAL: Never mention tools, tool calls, or tool usage in your final response text unless the user directly asks what tools you have. Never say "I don't need tools" or "no tools needed." Just answer naturally.
 
 If the user directly asks what tools you have or can see, list them by name (and only then). Otherwise, stay silent about tools.
 
@@ -51,11 +74,14 @@ Your available tools:
 - search_vault: Full-text search through the Obsidian vault
 - web_search: Search the web for current information
 - save_note: Save or update a note in the Obsidian vault
-- write_file: Write content to a file on disk
+- write_file: Write content to a file on disk (USE THIS FOR CREATING CODE/FILES — do NOT output file contents in chat)
 - execute_command: Run a shell command
 - list_vault: List files and folders in the Obsidian vault
 - get_active_file: Get the currently open file in Obsidian
-- get_daily_note: Get today's daily note from Obsidian`;
+- get_daily_note: Get today's daily note from Obsidian
+- search_memory: Search past conversations and interactions`;
+  
+  return prompt;
 }
 
 // ─── Build native tool definitions for the API ─────────────────────────
@@ -1017,6 +1043,9 @@ export default function AIVoiceAgentDemo() {
   const [showMcpConsole, setShowMcpConsole] = useState(false);
   const [mcpReady, setMcpReady] = useState(false);
   const [callingTool, setCallingTool] = useState<string | null>(null);
+  const [iteration, setIteration] = useState(0);
+  const [obsidianStatus, setObsidianStatus] = useState<"checking" | "connected" | "disconnected">("checking");
+  const [memoryCount, setMemoryCount] = useState(() => getMemories().length);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -1078,6 +1107,34 @@ export default function AIVoiceAgentDemo() {
       if (synthRef.current) {
         synthRef.current.onvoiceschanged = null;
       }
+    };
+  }, []);
+
+  // ── Obsidian Health Check (polls every 15s) ───────────────────────────────
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const check = async () => {
+      try {
+        const res = await checkObsidianStatus();
+        if (!cancelled) {
+          setObsidianStatus(res.ok ? "connected" : "disconnected");
+        }
+      } catch {
+        if (!cancelled) setObsidianStatus("disconnected");
+      }
+    };
+
+    // Initial check
+    check();
+
+    // Poll every 15 seconds
+    const interval = setInterval(check, 15_000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
     };
   }, []);
 
@@ -1315,66 +1372,84 @@ export default function AIVoiceAgentDemo() {
 
       try {
         const history = messagesRef.current.map((m) => ({
-          role: m.role,
+          role: m.role as "user" | "assistant",
           content: m.text,
         }));
 
-        const systemPrompt = buildSystemPrompt();
+        // ── Retrieve relevant past memories ─────────────────────────
+        const relevantMemories = searchMemories(text, 5);
+        const memoryContext = formatMemoriesForPrompt(relevantMemories);
+        const systemPrompt = buildSystemPrompt(memoryContext);
         const toolsForAPI = buildToolsForAPI();
+        const MAX_ITERATIONS = 25;
 
-        // ── Step 1: LLM call with native tool definitions ──────────────
-        const body1: Record<string, unknown> = {
-          model: "meta/llama-3.1-70b-instruct",
-          max_tokens: 800,
-          temperature: 0.5,
-          messages: [
-            { role: "system", content: systemPrompt },
-            ...history,
-            { role: "user", content: text },
-          ],
-        };
-        // Only attach tools if MCP gave us some
-        if (toolsForAPI.length > 0) {
-          body1.tools = toolsForAPI;
-          body1.tool_choice = "auto";
-        }
+        // Build conversation messages (system + history + current user message)
+        const messages: Array<Record<string, unknown>> = [
+          { role: "system", content: systemPrompt },
+          ...history,
+          { role: "user", content: text },
+        ];
 
-        const controller1 = new AbortController();
-        const timeout1 = setTimeout(() => controller1.abort(), 30_000);
-        let res1: Response;
-        try {
-          res1 = await fetch("/api/nvidia/v1/chat/completions", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${import.meta.env.VITE_NVIDIA_API_KEY}`,
-            },
-            body: JSON.stringify(body1),
-            signal: controller1.signal,
-          });
-        } finally {
-          clearTimeout(timeout1);
-        }
-
-        const data1 = await res1.json();
-        if (!res1.ok) {
-          throw new Error(data1.error?.message || `API error: ${res1.status}`);
-        }
-
-        const message = data1.choices?.[0]?.message;
-        let reply: string = message?.content ?? "";
-        const nativeToolCalls: Array<{
-          id: string;
-          type: string;
-          function: { name: string; arguments: string };
-        }> = message?.tool_calls ?? [];
+        let finalReply = "";
         const toolsUsed: { name: string; args: Record<string, unknown> }[] = [];
+        let iter = 0;
 
-        // ── Step 2: Execute native tool calls (single path, no text fallback) ──
-        if (nativeToolCalls.length > 0) {
-          const toolResultMessages: Array<{ role: string; tool_call_id: string; content: string }> = [];
+        // ── ReAct Loop: call LLM + execute tools until we get a text answer ──
+        for (; iter < MAX_ITERATIONS; iter++) {
+          setIteration(iter + 1);
 
-          for (const tc of nativeToolCalls) {
+          const body: Record<string, unknown> = {
+            model: "meta/llama-3.1-70b-instruct",
+            max_tokens: 800,
+            temperature: 0.5,
+            messages,
+          };
+          if (toolsForAPI.length > 0) {
+            body.tools = toolsForAPI;
+            body.tool_choice = "auto";
+          }
+
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 60_000);
+          let res: Response;
+          try {
+            res = await fetch("/api/nvidia/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${import.meta.env.VITE_NVIDIA_API_KEY}`,
+              },
+              body: JSON.stringify(body),
+              signal: controller.signal,
+            });
+          } finally {
+            clearTimeout(timeout);
+          }
+
+          const data = await res.json();
+          if (!res.ok) {
+            throw new Error(data.error?.message || `API error: ${res.status}`);
+          }
+
+          const choice = data.choices?.[0]?.message;
+          const content = choice?.content ?? "";
+          const toolCalls: Array<{
+            id: string;
+            type: string;
+            function: { name: string; arguments: string };
+          }> = choice?.tool_calls ?? [];
+
+          // No tool calls → this is the final answer
+          if (toolCalls.length === 0) {
+            finalReply = content;
+            break;
+          }
+
+          // ── Execute tool calls ──
+          // First push the assistant message with tool_calls to maintain conversation state
+          messages.push({ role: "assistant", content: null, tool_calls: toolCalls });
+
+          for (const tc of toolCalls) {
             if (tc.type !== "function") continue;
             const fnName = tc.function.name;
             let fnArgs: Record<string, unknown> = {};
@@ -1393,57 +1468,26 @@ export default function AIVoiceAgentDemo() {
               textResult = `Error calling ${fnName}: ${toolErr instanceof Error ? toolErr.message : String(toolErr)}`;
             }
 
-            toolResultMessages.push({ role: "tool", tool_call_id: tc.id, content: textResult });
+            messages.push({ role: "tool", tool_call_id: tc.id, content: textResult });
             toolsUsed.push({ name: fnName, args: fnArgs });
           }
           setCallingTool(null);
-
-          // ── Step 3: Send tool results back for final answer ────────────
-          const controller2 = new AbortController();
-          const timeout2 = setTimeout(() => controller2.abort(), 15_000);
-          let res2: Response;
-          try {
-            res2 = await fetch("/api/nvidia/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${import.meta.env.VITE_NVIDIA_API_KEY}`,
-              },
-              body: JSON.stringify({
-              model: "meta/llama-3.1-70b-instruct",
-              max_tokens: 300,
-              temperature: 0.5,
-              messages: [
-                {
-                  role: "system",
-                  content:
-                    "You are Sid's concise voice assistant. Answer in 1-3 sentences. No bullet points. Be direct and natural. Never mention tools or tool calls in your response.",
-                },
-                ...history,
-                { role: "user", content: text },
-                message,
-                ...toolResultMessages,
-              ],
-              signal: controller2.signal,
-            }),
-          });
-        } finally {
-          clearTimeout(timeout2);
+          // Continue loop — next iteration sends updated messages back to LLM
         }
 
-          const data2 = await res2.json();
-          if (!res2.ok) {
-            throw new Error(data2.error?.message || `API error: ${res2.status}`);
-          }
-          reply = data2.choices?.[0]?.message?.content ?? reply;
+        setCallingTool(null);
+        setIteration(0);
+
+        // If we hit max iterations without a final answer, provide a default response
+        if (!finalReply) {
+          finalReply = "I've completed the task. Let me know if you need anything else.";
         }
 
-        // Trim any accidental leading/trailing whitespace
-        reply = reply.trim() || "Got it.";
+        finalReply = finalReply.trim() || "Got it.";
 
         const assistantMsg: ChatMessage = {
           role: "assistant",
-          text: reply,
+          text: finalReply,
           tools: toolsUsed.length > 0 ? toolsUsed : undefined,
           time: new Date().toLocaleTimeString("en", { hour: "2-digit", minute: "2-digit" }),
         };
@@ -1456,8 +1500,15 @@ export default function AIVoiceAgentDemo() {
         setLoading(false);
         pendingRef.current = false;
 
-        if (voiceEnabled) {
-          await speakText(reply);
+        // ── Save to memory ──────────────────────────────────────────
+        const toolNames = toolsUsed.map((t) => t.name);
+        const memorySummary = summarizeInteraction(text, finalReply, toolNames);
+        saveMemory({ userMessage: text, agentResponse: finalReply, toolsUsed: toolNames, summary: memorySummary });
+        setMemoryCount(getMemories().length);
+
+        // Only speak the final answer (not intermediate tool steps)
+        if (voiceEnabled && iter < MAX_ITERATIONS) {
+          await speakText(finalReply);
         }
       } catch (err) {
         const errorText =
@@ -1476,6 +1527,13 @@ export default function AIVoiceAgentDemo() {
         setLoading(false);
         pendingRef.current = false;
         setVoiceStatus("idle");
+        setCallingTool(null);
+        setIteration(0);
+
+        // ── Save error to memory too (so agent learns what broke) ────
+        const errSummary = summarizeInteraction(text, errorText, []);
+        saveMemory({ userMessage: text, agentResponse: errorText, toolsUsed: [], summary: errSummary });
+        setMemoryCount(getMemories().length);
 
         if (voiceEnabled) {
           await speakText(errorText);
@@ -1791,6 +1849,43 @@ export default function AIVoiceAgentDemo() {
               MCP: {mcpReady ? "CONNECTED" : "INIT"}
             </span>
             <div style={{ width: 1, height: 10, background: `${HUD_PRIMARY}20` }} />
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <div
+                style={{
+                  width: 5,
+                  height: 5,
+                  borderRadius: "50%",
+                  background:
+                    obsidianStatus === "connected"
+                      ? "#22c55e"
+                      : obsidianStatus === "disconnected"
+                      ? "#ef4444"
+                      : "#f59e0b",
+                  boxShadow:
+                    obsidianStatus === "connected"
+                      ? "0 0 6px #22c55e"
+                      : obsidianStatus === "disconnected"
+                      ? "0 0 6px #ef4444"
+                      : "0 0 6px #f59e0b",
+                  animation:
+                    obsidianStatus === "checking"
+                      ? "pulse-dot 1s ease-in-out infinite"
+                      : obsidianStatus === "connected"
+                      ? "pulse-dot 2s ease-in-out infinite"
+                      : "none",
+                }}
+              />
+              <span style={{ fontSize: 8, color: `${HUD_PRIMARY}60`, letterSpacing: "0.1em" }}>
+                VAULT: {obsidianStatus === "connected" ? "LINKED" : obsidianStatus === "disconnected" ? "OFFLINE" : "SCAN"}
+              </span>
+            </div>
+            <div style={{ width: 1, height: 10, background: `${HUD_PRIMARY}20` }} />
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={{ fontSize: 8, color: `${HUD_PRIMARY}50`, letterSpacing: "0.1em" }}>
+                🧠 {memoryCount}
+              </span>
+            </div>
+            <div style={{ width: 1, height: 10, background: `${HUD_PRIMARY}20` }} />
             <span style={{ fontSize: 8, color: `${HUD_PRIMARY}40`, letterSpacing: "0.1em" }}>
               {voiceStatus === "idle" ? "IDLE" : voiceStatus === "listening" ? "RECEIVING" : voiceStatus === "processing" ? "ANALYZING" : "TRANSMITTING"}
             </span>
@@ -1907,8 +2002,10 @@ export default function AIVoiceAgentDemo() {
                 {callingTool ? (
                   <>
                     <span style={{ color: "#22d3ee", fontWeight: 600 }}>⟐ {callingTool}()</span>
-                    <span style={{ color: `${HUD_PRIMARY}40` }}> — RUNNING</span>
+                    <span style={{ color: `${HUD_PRIMARY}40` }}> — STEP {iteration}/25</span>
                   </>
+                ) : iteration > 0 ? (
+                  <>&gt; ANALYZING — STEP {iteration}/25</>
                 ) : (
                   <>&gt; ANALYZING</>
                 )}
@@ -2142,6 +2239,25 @@ export default function AIVoiceAgentDemo() {
                           <span style={{ fontSize: 10, color: "#22d3ee", fontFamily: "monospace" }}>
                             ⟐ {callingTool}()
                           </span>
+                          <span style={{ fontSize: 8, color: "#888", fontFamily: "monospace" }}>
+                            STEP {iteration}/25
+                          </span>
+                        </>
+                      ) : iteration > 0 ? (
+                        <>
+                          <div
+                            style={{
+                              width: 6,
+                              height: 6,
+                              borderRadius: "50%",
+                              background: "#f59e0b",
+                              boxShadow: "0 0 6px #f59e0b",
+                              animation: "pulse-dot 1.2s ease-in-out infinite",
+                            }}
+                          />
+                          <span style={{ fontSize: 9, color: "#f59e0b", fontFamily: "monospace" }}>
+                            ANALYZING — STEP {iteration}/25
+                          </span>
                         </>
                       ) : (
                         [0, 1, 2].map((i) => (
@@ -2250,7 +2366,66 @@ export default function AIVoiceAgentDemo() {
           background: "#050a07",
         }}
       >
-        <span>MY VAULT · 7 TOOLS · LLAMA 3.1 70B VIA NVIDIA</span>
+        <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span>MY VAULT · 7 TOOLS · LLAMA 3.1 70B VIA NVIDIA</span>
+          <span
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
+              color:
+                obsidianStatus === "connected"
+                  ? "#22c55e"
+                  : obsidianStatus === "disconnected"
+                  ? "#ef4444"
+                  : "#f59e0b",
+            }}
+          >
+            <span
+              style={{
+                display: "inline-block",
+                width: 5,
+                height: 5,
+                borderRadius: "50%",
+                background: "currentColor",
+              }}
+            />
+            OBSIDIAN {obsidianStatus === "connected" ? "LINKED" : obsidianStatus === "disconnected" ? "OFFLINE" : "..."}
+          </span>
+          {memoryCount > 0 && (
+            <button
+              onClick={() => {
+                if (window.confirm("Clear all stored memories? This cannot be undone.")) {
+                  clearMemories();
+                  setMemoryCount(0);
+                }
+              }}
+              title="Clear all stored memories"
+              style={{
+                background: "transparent",
+                border: "1px solid #333",
+                borderRadius: 4,
+                padding: "2px 8px",
+                color: "#555",
+                fontSize: 8,
+                cursor: "pointer",
+                fontFamily: "inherit",
+                letterSpacing: "0.05em",
+                transition: "all 0.2s",
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.borderColor = "#ef4444";
+                e.currentTarget.style.color = "#ef4444";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.borderColor = "#333";
+                e.currentTarget.style.color = "#555";
+              }}
+            >
+              ✕ CLEAR MEM
+            </button>
+          )}
+        </span>
         <span aria-live="polite">
           {voiceStatus === "listening"
             ? "▲ RECV"
