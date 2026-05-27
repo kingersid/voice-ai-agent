@@ -1,4 +1,4 @@
-// ─── MCP Server Tests: write_file & execute_command ────────────────────────
+// ─── MCP Server Tests ──────────────────────────────────────────────────────
 import { describe, it, expect, beforeEach, afterEach, vi, beforeAll } from "vitest";
 import { MCPServer, setTavilyRateLimit } from "./mcp-server";
 import { InMemoryTransport } from "./mcp-transport";
@@ -16,6 +16,7 @@ function createServer(): MCPServer {
   return new MCPServer(transport);
 }
 
+/** Mock the next fetch call to return a given JSON response. */
 function mockFetchOnce(response: Partial<Response>) {
   return vi.spyOn(globalThis, "fetch").mockResolvedValueOnce({
     ok: true,
@@ -62,7 +63,6 @@ describe("write_file tool", () => {
     expect(result.content[0].type).toBe("text");
     expect((result.content[0] as any).text).toContain("✅ Written 42 chars to output/test.html");
 
-    // Verify fetch was called correctly
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(fetch).toHaveBeenCalledWith("/api/exec/write-file", {
       method: "POST",
@@ -170,7 +170,6 @@ describe("execute_command tool", () => {
     expect(output).toContain("file1.txt\nfile2.txt");
     expect(output).toContain("→ Exit code: 0");
 
-    // Verify fetch was called correctly
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(fetch).toHaveBeenCalledWith("/api/exec/run-command", {
       method: "POST",
@@ -315,16 +314,10 @@ describe("get_time tool", () => {
     expect(result.isError).toBeFalsy();
     expect(result.content[0].type).toBe("text");
     const text = (result.content[0] as any).text;
-
-    // Should include IST timezone indicator
     expect(text).toContain("(IST)");
-
-    // Should include today's date parts
     expect(text).toContain(String(before.getFullYear()));
     const monthName = before.toLocaleDateString("en", { month: "long" });
     expect(text).toContain(monthName);
-
-    // Should include time in HH:MM:SS format
     const timeMatch = text.match(/(\d{1,2}):(\d{2}):(\d{2})/);
     expect(timeMatch).not.toBeNull();
   });
@@ -343,15 +336,26 @@ describe("read_note tool", () => {
 
   beforeEach(() => {
     server = createServer();
+    vi.spyOn(globalThis, "fetch");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it("should return note content for an existing filename", async () => {
+    const noteContent = "# Sid Profile\n- Co-founder, Label Ethnic Vogue (Surat)\n- Teacher at PP Savani University";
+    mockFetchOnce({
+      ok: true,
+      status: 200,
+      text: async () => noteContent,
+    });
+
     const result: ToolCallResult = await server.callTool("read_note", {
       filename: "wiki/sid-profile.md",
     });
 
     expect(result.isError).toBeFalsy();
-    expect(result.content[0].type).toBe("text");
     const text = (result.content[0] as any).text;
     expect(text).toContain("[wiki/sid-profile.md]");
     expect(text).toContain("Label Ethnic Vogue");
@@ -359,45 +363,42 @@ describe("read_note tool", () => {
   });
 
   it("should return error for a non-existent filename", async () => {
+    mockFetchOnce({
+      ok: false,
+      status: 404,
+      text: async () => "Not found",
+    });
+
     const result: ToolCallResult = await server.callTool("read_note", {
       filename: "nonexistent.md",
     });
 
     expect(result.isError).toBe(true);
     const text = (result.content[0] as any).text;
-    expect(text).toContain("Note not found in Obsidian or cache: nonexistent.md");
-    expect(text).toContain("Available notes:");
-  });
-
-  it("should list available notes in the error message", async () => {
-    const result: ToolCallResult = await server.callTool("read_note", {
-      filename: "missing.md",
-    });
-
-    const text = (result.content[0] as any).text;
-    expect(text).toContain("wiki/sid-profile.md");
-    expect(text).toContain("wiki/my-investments.md");
-    expect(text).toContain("daily/routine.md");
+    expect(text).toContain("Could not read note");
+    expect(text).toContain("nonexistent.md");
   });
 
   it("should return error when filename is missing", async () => {
     const result: ToolCallResult = await server.callTool("read_note", {});
 
     expect(result.isError).toBe(true);
-    const text = (result.content[0] as any).text;
-    expect(text).toContain("Note not found in Obsidian or cache:");
-    expect(text).toContain("Available notes:");
+    expect((result.content[0] as any).text).toBe("Please provide a filename to read.");
+    expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("should handle filenames with special characters", async () => {
+  it("should return error when Obsidian is not configured", async () => {
+    vi.stubEnv("VITE_OBSIDIAN_API_KEY", "");
+
     const result: ToolCallResult = await server.callTool("read_note", {
-      filename: "output/2026-05-24 - Drinks with the Boys.md",
+      filename: "wiki/test.md",
     });
 
-    expect(result.isError).toBeFalsy();
-    const text = (result.content[0] as any).text;
-    expect(text).toContain("Drinks with the Boys");
-    expect(text).toContain("Patiala");
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain("Obsidian is not connected");
+    expect(fetch).not.toHaveBeenCalled();
+
+    vi.unstubAllEnvs();
   });
 });
 
@@ -408,9 +409,27 @@ describe("search_vault tool", () => {
 
   beforeEach(() => {
     server = createServer();
+    vi.spyOn(globalThis, "fetch");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it("should find notes matching query in content", async () => {
+    // First fetch: search POST
+    mockFetchOnce({
+      ok: true,
+      json: async () => [
+        { path: "wiki/meditation-sessions.md", match: "# Meditation\n- Weekly Thursday 9PM", score: 0.95 },
+      ],
+    });
+    // Second fetch: read each result
+    mockFetchOnce({
+      ok: true,
+      text: async () => "# Meditation\n- Weekly Thursday 9PM on Google Meet\n- Teacher: Archana Didi",
+    });
+
     const result: ToolCallResult = await server.callTool("search_vault", {
       query: "Archana",
     });
@@ -421,28 +440,12 @@ describe("search_vault tool", () => {
     expect(text).toContain("meditation-sessions");
   });
 
-  it("should find notes matching query in filename", async () => {
-    const result: ToolCallResult = await server.callTool("search_vault", {
-      query: "investment",
-    });
-
-    expect(result.isError).toBeFalsy();
-    const text = (result.content[0] as any).text;
-    expect(text).toContain("Search results for");
-    expect(text).toContain("my-investments");
-  });
-
-  it("should be case-insensitive", async () => {
-    const result: ToolCallResult = await server.callTool("search_vault", {
-      query: "ARCHANA",
-    });
-
-    expect(result.isError).toBeFalsy();
-    const text = (result.content[0] as any).text;
-    expect(text).toContain("meditation-sessions");
-  });
-
   it("should return no results for an unmatched query", async () => {
+    mockFetchOnce({
+      ok: true,
+      json: async () => [],
+    });
+
     const result: ToolCallResult = await server.callTool("search_vault", {
       query: "xyznonexistent123",
     });
@@ -452,38 +455,70 @@ describe("search_vault tool", () => {
     expect(text).toContain("No results found");
   });
 
-  it("should limit results to a maximum of 3", async () => {
+  it("should return error when query is empty", async () => {
+    const result: ToolCallResult = await server.callTool("search_vault", {});
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toBe("Please provide a search query.");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("should handle search API failure gracefully", async () => {
+    mockFetchOnce({
+      ok: false,
+      status: 500,
+      text: async () => "Internal server error",
+    });
+
     const result: ToolCallResult = await server.callTool("search_vault", {
-      query: "the",
+      query: "test",
+    });
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain("Search failed");
+  });
+
+  it("should limit results to a maximum of 3", async () => {
+    // Return 5 results
+    const manyResults = Array.from({ length: 5 }, (_, i) => ({
+      path: `wiki/note-${i + 1}.md`,
+      match: `Content for note ${i + 1}`,
+      score: 1.0 - i * 0.1,
+    }));
+    mockFetchOnce({
+      ok: true,
+      json: async () => manyResults,
+    });
+    // Read each of the 3 limited results
+    for (let i = 0; i < 3; i++) {
+      mockFetchOnce({
+        ok: true,
+        text: async () => `# Note ${i + 1}\nContent for note ${i + 1}.`,
+      });
+    }
+
+    const result: ToolCallResult = await server.callTool("search_vault", {
+      query: "note",
     });
 
     expect(result.isError).toBeFalsy();
     const text = (result.content[0] as any).text;
-    const matches = text.match(/\[.*?\]:/g);
+    const matches = text.match(/\[.*?\]/g);
     expect(matches).not.toBeNull();
     expect(matches!.length).toBeLessThanOrEqual(3);
   });
 
-  it("should search across multiple content fields", async () => {
+  it("should return error when Obsidian is not configured", async () => {
+    vi.stubEnv("VITE_OBSIDIAN_API_KEY", "");
+
     const result: ToolCallResult = await server.callTool("search_vault", {
-      query: "Meditation",
+      query: "test",
     });
 
-    expect(result.isError).toBeFalsy();
-    const text = (result.content[0] as any).text;
-    expect(text).toContain("meditation-sessions");
-  });
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain("Obsidian is not connected");
 
-  it("should return all notes when query is an empty string (matches everything)", async () => {
-    // When query is empty, all notes match because "".includes("") is always true
-    const result: ToolCallResult = await server.callTool("search_vault", {});
-
-    expect(result.isError).toBeFalsy();
-    const text = (result.content[0] as any).text;
-    const matches = text.match(/\[.*?\]:/g);
-    expect(matches).not.toBeNull();
-    // There are 7 notes in the default vault
-    expect(matches!.length).toBeLessThanOrEqual(3); // limited to 3
+    vi.unstubAllEnvs();
   });
 });
 
@@ -494,7 +529,6 @@ describe("web_search tool", () => {
 
   beforeEach(() => {
     server = createServer();
-    // Set a dummy API key for tests that need it
     vi.stubEnv("VITE_TAVILY_API_KEY", "test-tavily-key");
     vi.spyOn(globalThis, "fetch");
   });
@@ -564,7 +598,6 @@ describe("web_search tool", () => {
     expect(text).toContain("https://example.com/ipl-2025");
     expect(text).toContain("Indian Premier League");
 
-    // Verify fetch was called with correct URL and body
     expect(fetch).toHaveBeenCalledWith("/api/tavily/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -596,7 +629,6 @@ describe("web_search tool", () => {
 
     expect(result.isError).toBeFalsy();
     const text = (result.content[0] as any).text;
-    // Should have at most 5 numbered results (1. through 5.)
     const numberedResults = text.match(/\d+\.\s/g);
     expect(numberedResults?.length).toBe(5);
   });
@@ -657,9 +689,8 @@ describe("web_search tool", () => {
 
     expect(result.isError).toBeFalsy();
     const text = (result.content[0] as any).text;
-    // Each snippet is limited to 300 chars
     const snippet = text.split("URL:")[1]?.split("\n")[1] ?? "";
-    expect(snippet.length).toBeLessThanOrEqual(305); // 300 + some padding from formatting
+    expect(snippet.length).toBeLessThanOrEqual(305);
   });
 });
 
@@ -677,11 +708,11 @@ describe("save_note tool", () => {
     vi.restoreAllMocks();
   });
 
-  it("should save note to vault and return success", async () => {
-    // Simulate GitHub backend being available
+  it("should save note to Obsidian vault and return success", async () => {
     mockFetchOnce({
       ok: true,
-      json: async () => ({ path: "wiki/test-note.md", success: true }),
+      status: 200,
+      text: async () => JSON.stringify({ ok: true }),
     });
 
     const result: ToolCallResult = await server.callTool("save_note", {
@@ -691,39 +722,8 @@ describe("save_note tool", () => {
 
     expect(result.isError).toBeFalsy();
     expect((result.content[0] as any).text).toContain("Note saved to Obsidian vault: wiki/test-note.md");
-
-    // Verify fetch was called to persist to GitHub
-    expect(fetch).toHaveBeenCalledWith("/api/vault/save", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        filename: "wiki/test-note.md",
-        content: "# Test Note\nThis is a test note.",
-      }),
-    });
-  });
-
-  it("should persist the note in the vault and make it readable", async () => {
-    // Simulate GitHub backend being available
-    mockFetchOnce({
-      ok: true,
-      json: async () => ({ path: "wiki/test-note.md", success: true }),
-    });
-
-    await server.callTool("save_note", {
-      filename: "wiki/test-note.md",
-      content: "# Persist Test\nThis should be readable.",
-    });
-
-    // The note should now be readable via read_note
-    const readResult: ToolCallResult = await server.callTool("read_note", {
-      filename: "wiki/test-note.md",
-    });
-
-    expect(readResult.isError).toBeFalsy();
-    const text = (readResult.content[0] as any).text;
-    expect(text).toContain("# Persist Test");
-    expect(text).toContain("This should be readable.");
+    // Should report character count
+    expect((result.content[0] as any).text).toContain("chars");
   });
 
   it("should return error when filename is missing", async () => {
@@ -754,79 +754,325 @@ describe("save_note tool", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("should still save to in-memory vault when GitHub fetch fails", async () => {
-    // Simulate backend unavailable (fetch throws)
-    vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("Connection refused"));
-
-    const result: ToolCallResult = await server.callTool("save_note", {
-      filename: "wiki/offline-note.md",
-      content: "# Offline Note\nSaved even though backend is down.",
-    });
-
-    // Should still return success for in-memory save
-    expect(result.isError).toBeFalsy();
-    expect((result.content[0] as any).text).toContain("Note cached in-memory: wiki/offline-note.md");
-
-    // The note should be readable from in-memory vault
-    const readResult: ToolCallResult = await server.callTool("read_note", {
-      filename: "wiki/offline-note.md",
-    });
-    expect(readResult.isError).toBeFalsy();
-    expect((readResult.content[0] as any).text).toContain("Offline Note");
-  });
-
-  it("should still save to in-memory vault when GitHub returns an error", async () => {
+  it("should return error when Obsidian write fails", async () => {
     mockFetchOnce({
       ok: false,
       status: 500,
-      json: async () => ({ error: "Internal server error" }),
+      text: async () => "Internal server error",
     });
 
     const result: ToolCallResult = await server.callTool("save_note", {
-      filename: "wiki/error-note.md",
-      content: "# Error Note\nGitHub failed but vault saved.",
+      filename: "wiki/fail-note.md",
+      content: "# Fail\nThis should fail.",
     });
 
-    // Should still return success for in-memory save
-    expect(result.isError).toBeFalsy();
-    expect((result.content[0] as any).text).toContain("Note cached in-memory: wiki/error-note.md");
-
-    // The note should be readable from in-memory vault
-    const readResult: ToolCallResult = await server.callTool("read_note", {
-      filename: "wiki/error-note.md",
-    });
-    expect(readResult.isError).toBeFalsy();
-    expect((readResult.content[0] as any).text).toContain("Error Note");
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain("Failed to save note");
   });
 
-  it("should overwrite existing note with the same filename", async () => {
-    // Save a note
+  it("should return error when Obsidian is not configured", async () => {
+    vi.stubEnv("VITE_OBSIDIAN_API_KEY", "");
+
+    const result: ToolCallResult = await server.callTool("save_note", {
+      filename: "wiki/test.md",
+      content: "# Test",
+    });
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain("Obsidian is not connected");
+    expect(fetch).not.toHaveBeenCalled();
+
+    vi.unstubAllEnvs();
+  });
+});
+
+// ─── list_vault Tests ──────────────────────────────────────────────────────
+
+describe("list_vault tool", () => {
+  let server: MCPServer;
+
+  beforeEach(() => {
+    server = createServer();
+    vi.spyOn(globalThis, "fetch");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("should list files and folders at root", async () => {
     mockFetchOnce({
       ok: true,
-      json: async () => ({ path: "wiki/updatable.md", success: true }),
+      json: async () => ({
+        files: [
+          { name: "wiki", type: "folder" },
+          { name: "daily", type: "folder" },
+          { name: "README.md", type: "file" },
+        ],
+      }),
     });
 
-    await server.callTool("save_note", {
-      filename: "wiki/updatable.md",
-      content: "# Original Content",
-    });
+    const result: ToolCallResult = await server.callTool("list_vault", {});
 
-    // Overwrite it
+    expect(result.isError).toBeFalsy();
+    const text = (result.content[0] as any).text;
+    expect(text).toContain('Contents of "root" in Obsidian vault:');
+    expect(text).toContain("📁 Folders:");
+    expect(text).toContain("wiki");
+    expect(text).toContain("daily");
+    expect(text).toContain("📄 Files:");
+    expect(text).toContain("README.md");
+  });
+
+  it("should list contents of a subdirectory", async () => {
     mockFetchOnce({
       ok: true,
-      json: async () => ({ path: "wiki/updatable.md", success: true }),
+      json: async () => ({
+        files: [
+          { name: "sid-profile.md", type: "file" },
+          { name: "my-investments.md", type: "file" },
+        ],
+      }),
     });
 
-    await server.callTool("save_note", {
-      filename: "wiki/updatable.md",
-      content: "# Updated Content",
+    const result: ToolCallResult = await server.callTool("list_vault", {
+      path: "wiki",
     });
 
-    // Should contain the updated content
-    const readResult: ToolCallResult = await server.callTool("read_note", {
-      filename: "wiki/updatable.md",
+    expect(result.isError).toBeFalsy();
+    const text = (result.content[0] as any).text;
+    expect(text).toContain('Contents of "wiki" in Obsidian vault:');
+    expect(text).toContain("sid-profile.md");
+    expect(text).toContain("my-investments.md");
+  });
+
+  it("should show empty message when directory has no contents", async () => {
+    mockFetchOnce({
+      ok: true,
+      json: async () => ({ files: [] }),
     });
-    expect((readResult.content[0] as any).text).toContain("# Updated Content");
-    expect((readResult.content[0] as any).text).not.toContain("Original Content");
+
+    const result: ToolCallResult = await server.callTool("list_vault", {
+      path: "empty-folder",
+    });
+
+    expect(result.isError).toBeFalsy();
+    const text = (result.content[0] as any).text;
+    expect(text).toContain("(empty)");
+  });
+
+  it("should handle API error gracefully", async () => {
+    mockFetchOnce({
+      ok: false,
+      status: 500,
+      text: async () => "Internal server error",
+    });
+
+    const result: ToolCallResult = await server.callTool("list_vault", {});
+
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as any).text;
+    expect(text).toContain("Could not list vault");
+  });
+
+  it("should return error when Obsidian is not configured", async () => {
+    vi.stubEnv("VITE_OBSIDIAN_API_KEY", "");
+
+    const result: ToolCallResult = await server.callTool("list_vault", {});
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain("Obsidian is not connected");
+    expect(fetch).not.toHaveBeenCalled();
+
+    vi.unstubAllEnvs();
+  });
+});
+
+// ─── get_active_file Tests ─────────────────────────────────────────────────
+
+describe("get_active_file tool", () => {
+  let server: MCPServer;
+
+  beforeEach(() => {
+    server = createServer();
+    vi.spyOn(globalThis, "fetch");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("should return active file path and content", async () => {
+    // First fetch: get active file path
+    mockFetchOnce({
+      ok: true,
+      json: async () => ({ path: "wiki/sid-profile.md" }),
+    });
+    // Second fetch: read the file content
+    mockFetchOnce({
+      ok: true,
+      text: async () => "# Sid Profile\n- Co-founder at Label Ethnic Vogue",
+    });
+
+    const result: ToolCallResult = await server.callTool("get_active_file", {});
+
+    expect(result.isError).toBeFalsy();
+    const text = (result.content[0] as any).text;
+    expect(text).toContain("📍 Active file: wiki/sid-profile.md");
+    expect(text).toContain("Label Ethnic Vogue");
+  });
+
+  it("should return message when no file is open", async () => {
+    mockFetchOnce({
+      ok: true,
+      json: async () => ({ path: "" }),
+    });
+
+    const result: ToolCallResult = await server.callTool("get_active_file", {});
+
+    expect(result.isError).toBeFalsy();
+    const text = (result.content[0] as any).text;
+    expect(text).toBe("No file is currently open in Obsidian.");
+  });
+
+  it("should handle active file API failure", async () => {
+    mockFetchOnce({
+      ok: false,
+      status: 500,
+      text: async () => "Server error",
+    });
+
+    const result: ToolCallResult = await server.callTool("get_active_file", {});
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain("Could not get active file");
+  });
+
+  it("should handle file content read failure", async () => {
+    // First fetch: get active file path — succeeds
+    mockFetchOnce({
+      ok: true,
+      json: async () => ({ path: "wiki/sid-profile.md" }),
+    });
+    // Second fetch: read the file — fails
+    mockFetchOnce({
+      ok: false,
+      status: 404,
+      text: async () => "Not found",
+    });
+
+    const result: ToolCallResult = await server.callTool("get_active_file", {});
+
+    expect(result.isError).toBeFalsy();
+    const text = (result.content[0] as any).text;
+    expect(text).toContain("Active file: wiki/sid-profile.md");
+    expect(text).toContain("could not read content");
+  });
+
+  it("should return error when Obsidian is not configured", async () => {
+    vi.stubEnv("VITE_OBSIDIAN_API_KEY", "");
+
+    const result: ToolCallResult = await server.callTool("get_active_file", {});
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain("Obsidian is not connected");
+    expect(fetch).not.toHaveBeenCalled();
+
+    vi.unstubAllEnvs();
+  });
+});
+
+// ─── get_daily_note Tests ──────────────────────────────────────────────────
+
+describe("get_daily_note tool", () => {
+  let server: MCPServer;
+
+  beforeEach(() => {
+    server = createServer();
+    vi.spyOn(globalThis, "fetch");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("should return today's daily note content", async () => {
+    // First fetch: get daily note path
+    mockFetchOnce({
+      ok: true,
+      json: async () => ({ path: "daily/2026-05-27.md" }),
+    });
+    // Second fetch: read the file content
+    mockFetchOnce({
+      ok: true,
+      text: async () => "# Daily Note\n- Woke up early\n- Worked on voice agent",
+    });
+
+    const result: ToolCallResult = await server.callTool("get_daily_note", {});
+
+    expect(result.isError).toBeFalsy();
+    const text = (result.content[0] as any).text;
+    expect(text).toContain("📅 Today's daily note");
+    expect(text).toContain("daily/2026-05-27.md");
+    expect(text).toContain("Worked on voice agent");
+  });
+
+  it("should return message when no daily note exists", async () => {
+    mockFetchOnce({
+      ok: true,
+      json: async () => ({ path: "" }),
+    });
+
+    const result: ToolCallResult = await server.callTool("get_daily_note", {});
+
+    expect(result.isError).toBeFalsy();
+    const text = (result.content[0] as any).text;
+    expect(text).toBe("No daily note found for today. Create one in Obsidian first.");
+  });
+
+  it("should handle periodic note API failure", async () => {
+    mockFetchOnce({
+      ok: false,
+      status: 500,
+      text: async () => "Internal server error",
+    });
+
+    const result: ToolCallResult = await server.callTool("get_daily_note", {});
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain("Could not find today's daily note");
+  });
+
+  it("should handle daily note read failure", async () => {
+    // First fetch: get daily note path — succeeds
+    mockFetchOnce({
+      ok: true,
+      json: async () => ({ path: "daily/2026-05-27.md" }),
+    });
+    // Second fetch: read the file — fails
+    mockFetchOnce({
+      ok: false,
+      status: 404,
+      text: async () => "Not found",
+    });
+
+    const result: ToolCallResult = await server.callTool("get_daily_note", {});
+
+    expect(result.isError).toBeFalsy();
+    const text = (result.content[0] as any).text;
+    expect(text).toContain("Daily note: daily/2026-05-27.md");
+    expect(text).toContain("could not read");
+  });
+
+  it("should return error when Obsidian is not configured", async () => {
+    vi.stubEnv("VITE_OBSIDIAN_API_KEY", "");
+
+    const result: ToolCallResult = await server.callTool("get_daily_note", {});
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain("Obsidian is not connected");
+    expect(fetch).not.toHaveBeenCalled();
+
+    vi.unstubAllEnvs();
   });
 });

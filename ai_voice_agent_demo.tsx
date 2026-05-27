@@ -41,7 +41,21 @@ For general chat, greetings, or questions you can confidently answer from memory
 
 If the user asks about a place, travel destination, city, country, or ANY factual question you're uncertain about, ALWAYS use the web_search tool to get accurate, current information.
 
-⚠️ CRITICAL: Never mention tools, tool calls, or tool usage in your response text. Never say "I don't need tools" or "no tools needed." Just answer as a normal assistant.`;
+⚠️ CRITICAL: Never mention tools, tool calls, or tool usage in your response text unless the user directly asks what tools you have. Never say "I don't need tools" or "no tools needed." Just answer as a normal assistant.
+
+If the user directly asks what tools you have or can see, list them by name (and only then). Otherwise, stay silent about tools.
+
+Your available tools:
+- get_time: Get the current date and time (IST)
+- read_note: Read a note from the Obsidian vault
+- search_vault: Full-text search through the Obsidian vault
+- web_search: Search the web for current information
+- save_note: Save or update a note in the Obsidian vault
+- write_file: Write content to a file on disk
+- execute_command: Run a shell command
+- list_vault: List files and folders in the Obsidian vault
+- get_active_file: Get the currently open file in Obsidian
+- get_daily_note: Get today's daily note from Obsidian`;
 }
 
 // ─── Build native tool definitions for the API ─────────────────────────
