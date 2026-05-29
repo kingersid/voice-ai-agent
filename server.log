@@ -1,0 +1,20 @@
+
+> ai-voice-agent-demo@1.0.0 dev
+> concurrently -k -n "vite,vault" -c "cyan,yellow" "vite" "node server/index.js"
+
+[vault] [vault] DEBUG: VAULT_GIT_URL = (not set)
+[vault] [vault] DEBUG: GITHUB_TOKEN = (not set)
+[vault] [vault] DEBUG: CWD = C:\Users\lenovo\Desktop\voice-ai-agent
+[vault] [vault] Server running on http://localhost:3001
+[vault] [vault] ⚠️  VAULT_GIT_URL not set — save will fail until configured
+[vault] [vault] ⚠️  GITHUB_TOKEN not set — save will fail until configured
+[vite] 
+[vite]   [32m[1mVITE[22m v6.4.2[39m  [2mready in [0m[1m1055[22m[2m[0m ms[22m
+[vite] 
+[vite]   [32m➜[39m  [1mLocal[22m:   [36mhttp://localhost:[1m5173[22m/[39m
+[vite] [2m  [32m➜[39m  [1mNetwork[22m[2m: use [22m[1m--host[22m[2m to expose[22m
+[vault] ^C
+[vite] ^C
+[vite] vite exited with code 3221225786
+--> Sending SIGTERM to other processes..
+[vault] node server/index.js exited with code 3221225786

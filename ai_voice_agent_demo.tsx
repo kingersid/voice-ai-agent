@@ -5,6 +5,7 @@ import { InMemoryTransport } from "./src/lib/mcp-transport";
 import type { Tool, ToolCallResult, JSONSchema } from "./src/lib/mcp-types";
 import { getToolResultText } from "./src/lib/mcp-types";
 import { checkObsidianStatus } from "./src/lib/obsidian-client";
+
 import {
   getMemories,
   searchMemories,
@@ -42,7 +43,9 @@ function getMCPInitPromise(): Promise<Tool[]> {
 }
 
 function buildSystemPrompt(memoryContext?: string): string {
-  let prompt = `You are Sid's voice assistant. Be natural and direct. No introductions.
+  let prompt = `You're Sid's assistant — talk to him like a smart friend who's got his back. Direct, natural, no fluff. Use contractions (it's, don't, I'll, you're). Vary your sentence lengths. Avoid bullet points and lists unless he specifically asks for structure.
+
+Think of yourself as plugged into his world — you have access to his notes, his vault, web search, and files. But don't sound like a tool manual. Sound like someone who knows what they're talking about and says it plainly.
 
 `;
 
@@ -51,24 +54,17 @@ function buildSystemPrompt(memoryContext?: string): string {
     prompt += `${memoryContext}\n\n`;
   }
 
-  prompt += `For simple questions (greetings, opinions, general chat), answer directly from your knowledge without using tools.
+  prompt += `A few ground rules:
 
-For questions needing information, use tools as needed. You can call multiple tools in sequence — each tool call result will be provided back to you so you can keep working through a task step by step.
-
-⚠️ FILE CREATION RULE: When the user asks you to CREATE, WRITE, or BUILD a file (code, HTML, CSS, JS, a game, etc.), you MUST use the write_file tool to write it to disk. Do NOT output the file contents in your chat response — just use write_file, then briefly inform the user what was created.
-
-IMPORTANT: The write_file tool's 'content' parameter must contain the COMPLETE file content in a single call — do not split file content across multiple tool calls or iterations. Generate the full file at once.
-
-For COMPLEX TASKS (coding, file operations, multi-step research), work through them methodically:
-1. Break the task into logical steps
-2. Call tools to accomplish each step
-3. When the task is fully complete, provide a clear summary as your final answer
-
-If the user asks about a place, travel destination, city, country, or ANY factual question you're uncertain about, ALWAYS use the web_search tool to get accurate, current information.
-
-⚠️ CRITICAL: Never mention tools, tool calls, or tool usage in your final response text unless the user directly asks what tools you have. Never say "I don't need tools" or "no tools needed." Just answer naturally.
-
-If the user directly asks what tools you have or can see, list them by name (and only then). Otherwise, stay silent about tools.
+• For simple stuff — greetings, opinions, general chat — just answer from what you know. No need to reach for tools.
+• For things that need info, use your tools as needed. You can chain them together step by step.
+• When Sid asks you to CREATE, WRITE, or BUILD a file (code, HTML, a game, whatever), use write_file to save it to disk. Don't dump the contents in chat — just write it and let him know it's done. The write_file 'content' field needs the COMPLETE file in one go — don't split it across multiple calls.
+• For multi-step work (coding, research, file ops), break it into logical steps, work through them with your tools, then give a clear summary when you're done.
+• If Sid asks about a place, a fact, anything you're not solid on — use web_search. Don't guess.
+• For long notes/content (over ~500 words), break the content into smaller chunks and save them across multiple iterations — the tool loop lets you split long content into manageable pieces.
+• After saving a long note, call read_note to verify the full content was saved. If the note seems cut off, re-save the missing portion.
+• Never mention your tools, tool calls, or internal process in your responses. Just answer naturally. If he asks what tools you have, list them — otherwise keep quiet.
+• Keep it conversational. Use natural transitions like "So...", "Actually...", "Well..." instead of "Furthermore" or "In conclusion".
 
 Your available tools:
 - get_time: Get the current date and time (IST)
@@ -161,6 +157,13 @@ interface ChatMessage {
 }
 
 type VoiceStatus = "idle" | "listening" | "processing" | "speaking";
+
+interface SpeechChunk {
+  text: string;
+  rate: number;
+  pitch: number;
+  pauseAfter: number; // ms pause after this chunk
+}
 
 // ─── Text-to-tool-call fallback parser ──────────────────────────────────
 // Llama 3.1 70B sometimes ignores tool_choice and outputs tool calls as
@@ -275,11 +278,256 @@ function parseTextToolCalls(content: string): Array<{
   return results.length > 0 ? results : null;
 }
 
-// ─── HUD Waveform (continuous, sci-fi style) ────────────────────────────────
+// ─── Response Humanizer ────────────────────────────────────────────────────
+// Post-processes LLM output to make it sound more natural and human-like.
+// Handles: contractions, casual transitions, filler words, and stripping
+// overly formal language.
 
-function HudWaveform({ isActive, volume }: { isActive: boolean; volume: number }) {
+function humanizeResponse(text: string): string {
+  if (!text) return text;
+
+  let result = text;
+
+  // 1. Replace overly formal transitions with casual ones
+  const formalPatterns: [RegExp, string][] = [
+    [/\bFurthermore,?\s*/gi, "Also, "],
+    [/\bIn addition,?\s*/gi, "Plus, "],
+    [/\bConsequently,?\s*/gi, "So, "],
+    [/\bNevertheless,?\s*/gi, "That said, "],
+    [/\bMoreover,?\s*/gi, "And "],
+    [/\bIn conclusion,?\s*/gi, "Anyway, "],
+    [/\bIt is worth noting that\s*/gi, "Worth noting — "],
+    [/\bIt should be noted that\s*/gi, "To be fair, "],
+    [/\bAdditionally,?\s*/gi, "Also, "],
+  ];
+  for (const [pattern, replacement] of formalPatterns) {
+    result = result.replace(pattern, replacement);
+  }
+
+  // 2. Ensure common contractions are used
+  const contractionPatterns: [RegExp, string][] = [
+    [/\bI am not\b/gi, "I'm not"],
+    [/\bI am\b/gi, "I'm"],
+    [/\bdo not\b/gi, "don't"],
+    [/\bcannot\b/gi, "can't"],
+    [/\bwill not\b/gi, "won't"],
+    [/\bshould not\b/gi, "shouldn't"],
+    [/\bcould not\b/gi, "couldn't"],
+    [/\bwould not\b/gi, "wouldn't"],
+    [/\bdid not\b/gi, "didn't"],
+    [/\bdoes not\b/gi, "doesn't"],
+    [/\bhe is\b/gi, "he's"],
+    [/\bshe is\b/gi, "she's"],
+    [/\bthey are\b/gi, "they're"],
+    [/\bwe are\b/gi, "we're"],
+    [/\bthat is\b/gi, "that's"],
+    [/\bwhat is\b/gi, "what's"],
+    [/\bthere is\b/gi, "there's"],
+    [/\bit is\b/gi, "it's"],
+  ];
+  for (const [pattern, replacement] of contractionPatterns) {
+    result = result.replace(pattern, replacement);
+  }
+
+  // 3. Occasionally add a casual filler at the start (10% chance)
+  if (Math.random() < 0.1 && result.length > 20) {
+    const fillers = ["Well, ", "Actually, ", "So, ", "You know, "];
+    const filler = fillers[Math.floor(Math.random() * fillers.length)];
+    // Only add if it doesn't already start with a filler word
+    const startsWithFiller = /^(Well|Actually|So|You know)/i.test(result);
+    if (!startsWithFiller) {
+      result = filler + result[0] + result.slice(1);
+    }
+  }
+
+  // 4. Strip markdown bullet points for voice (unless the text is clearly meant to be a list)
+  // Only strip leading bullets if the text is short enough to be spoken
+  if (result.length < 500) {
+    result = result.replace(/^\s*[-•*]\s+/gm, "");
+  }
+
+  // 5. Replace multiple consecutive newlines with single ones
+  result = result.replace(/\n{3,}/g, "\n\n");
+
+  return result.trim();
+}
+
+// ─── Speech Chunking — splits text into expressive phrases with dynamic rate/pitch/pause ─
+// Mimics SSML-like prosody: questions rise, exclamations pop, emphasis slows,
+// parentheticals lower, ellipsis trails off, and dialogue takes on a slightly different voice.
+
+function createSpeechChunk(text: string, _contextSentence: string): SpeechChunk {
+  let rate = 0.88;
+  let pitch = 1.0;
+  let pauseAfter = 180;
+
+  const trimmed = text.trim();
+  const lastChar = trimmed[trimmed.length - 1];
+  const endsSentence = /[.!?…]/.test(lastChar);
+  const endsClause = /[,;:\u2014\u2013]/.test(lastChar);
+
+  // ── Sentence-type prosody ────────────────────────────────────────────
+
+  if (lastChar === "?") {
+    // Questions: rising intonation, slightly slower
+    pitch = 1.10;
+    rate = 0.86;
+    pauseAfter = 320;
+  } else if (lastChar === "!") {
+    // Exclamations: energetic lift
+    pitch = 1.06;
+    rate = 0.92;
+    pauseAfter = 280;
+  } else if (/\.\.\.$|\u2026$/.test(trimmed)) {
+    // Ellipsis / trailing off: drop, slow down, longer pause
+    pitch = 0.90;
+    rate = 0.78;
+    pauseAfter = 500;
+  } else if (lastChar === ".") {
+    // Statement: slight cadence drop at end
+    pitch = 0.96;
+    rate = 0.86;
+    pauseAfter = 280;
+  } else if (endsClause) {
+    // Clause boundary: short pause
+    pauseAfter = lastChar === "," ? 60 : lastChar === ";" ? 100 : 120;
+  }
+
+  // ── Content-based emphasis ───────────────────────────────────────────
+
+  // ALL-CAPS words (e.g., "VERY", "NEVER") — slow down, slight pitch bump
+  if (/[A-Z\u00c0-\u0178]{3,}/.test(trimmed)) {
+    pitch += 0.025;
+    rate -= 0.015;
+  }
+
+  // Emphasis markers *word* or **phrase** — speak them slightly slower
+  if (/\*[^*]+\*/.test(trimmed)) {
+    pitch += 0.02;
+    rate -= 0.025;
+  }
+
+  // Quoted dialogue "..." or "..." — different "voice" via pitch shift
+  if (/[""“”]/.test(trimmed)) {
+    pitch += 0.03;
+  }
+
+  // Parenthetical content ( ... ) — lower, faster (aside-like)
+  if (/\([^)]+\)/.test(trimmed)) {
+    pitch -= 0.04;
+    rate += 0.04;
+  }
+
+  // ── Sub-clause detection (sentence continues after this chunk) ────
+  if (!endsSentence && !endsClause && trimmed.length < 100) {
+    pauseAfter = 80;
+  }
+
+  // ── Subtle natural variation ───────────────────────────────────────
+  const jitter = (Math.random() - 0.5) * 0.04;
+  pitch += jitter;
+  rate += (Math.random() - 0.5) * 0.03;
+
+  // Clamp to natural speech range
+  rate = Math.max(0.72, Math.min(1.15, rate));
+  pitch = Math.max(0.85, Math.min(1.2, pitch));
+
+  return {
+    text: trimmed,
+    rate: Math.round(rate * 100) / 100,
+    pitch: Math.round(pitch * 100) / 100,
+    pauseAfter,
+  };
+}
+
+function prepareSpeechChunks(text: string): SpeechChunk[] {
+  if (!text) return [];
+
+  // For very short text, return as-is
+  if (text.length < 10) {
+    return [{ text, rate: 0.92, pitch: 1.0, pauseAfter: 0 }];
+  }
+
+  const chunks: SpeechChunk[] = [];
+
+  // ── Split into sentences ───────────────────────────────────────────
+  // Handles . ! ? … and smart punctuation like "?!" "..." etc.
+  const sentences: string[] = [];
+  let buf = "";
+  for (let i = 0; i < text.length; i++) {
+    buf += text[i];
+    // Check for sentence-ending punctuation
+    if (/[.!?]/.test(text[i]) || text[i] === "\u2026" || text[i] === "…") {
+      // Ellipsis / triple-dot
+      const isEllipsis =
+        text[i] === "\u2026" ||
+        (text[i] === "." && i + 2 < text.length && text[i + 1] === "." && text[i + 2] === ".");
+      if (isEllipsis) {
+        // skip the next two dots if it's "..."
+        if (text[i] === ".") {
+          buf += text[i + 1] + text[i + 2];
+          i += 2;
+        }
+        sentences.push(buf.trim());
+        buf = "";
+        continue;
+      }
+      if (i + 1 >= text.length || /\s/.test(text[i + 1])) {
+        sentences.push(buf.trim());
+        buf = "";
+      }
+    }
+  }
+  if (buf.trim()) sentences.push(buf.trim());
+
+  // ── Sub-split sentences on clause boundaries ───────────────────────
+  for (const sentence of sentences) {
+    // Always split on clause boundaries for expressiveness, even in short sentences
+    const splitThreshold = sentence.length > 80 ? 60 : 120;
+
+    if (sentence.length > splitThreshold) {
+      let clauseBuf = "";
+      const parts: string[] = [];
+      for (let i = 0; i < sentence.length; i++) {
+        clauseBuf += sentence[i];
+        // Split on commas, semicolons, em-dashes, colons (but not at end of sentence)
+        if (/[,;\u2014\u2013:]/.test(sentence[i]) && i + 1 < sentence.length && i > 3) {
+          parts.push(clauseBuf.trim());
+          clauseBuf = "";
+        }
+      }
+      if (clauseBuf.trim()) parts.push(clauseBuf.trim());
+      for (const part of parts) {
+        if (part) chunks.push(createSpeechChunk(part, sentence));
+      }
+    } else {
+      chunks.push(createSpeechChunk(sentence, sentence));
+    }
+  }
+
+  return chunks.length > 0
+    ? chunks
+    : [{ text, rate: 0.88, pitch: 1.0, pauseAfter: 0 }];
+}
+
+// ─── HUD Waveform (continuous, sci-fi style) ────────────────────────────────
+// Shows live voice activity with a noise floor threshold line and
+// noise gate open/closed state for at-a-glance audio quality awareness.
+
+function HudWaveform({
+  isActive,
+  volume,
+  noiseFloor,
+  noiseGateOpen,
+}: {
+  isActive: boolean;
+  volume: number;
+  noiseFloor: number;
+  noiseGateOpen: boolean;
+}) {
   const barCount = 80;
   const color = "#22d3ee";
+  const gateColor = noiseGateOpen ? "#22c55e" : "#ef4444";
   const now = Date.now();
   return (
     <div
@@ -290,7 +538,7 @@ function HudWaveform({ isActive, volume }: { isActive: boolean; volume: number }
         alignItems: "center",
         justifyContent: "center",
         gap: 2,
-        height: 40,
+        height: 44,
         width: "100%",
         maxWidth: 520,
         margin: "0 auto",
@@ -307,6 +555,37 @@ function HudWaveform({ isActive, volume }: { isActive: boolean; volume: number }
           background: `linear-gradient(90deg, transparent, ${color}15, transparent)`,
         }}
       />
+      {/* Noise floor threshold line */}
+      {isActive && noiseFloor > 0.01 && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: `${20 + noiseFloor * 20}px`,
+            left: 0,
+            right: 0,
+            height: 1,
+            background: `linear-gradient(90deg, transparent, ${gateColor}60, transparent)`,
+            opacity: 0.6,
+            transition: "all 0.3s ease",
+          }}
+        />
+      )}
+      {/* Noise floor label */}
+      {isActive && noiseFloor > 0.01 && (
+        <div
+          style={{
+            position: "absolute",
+            right: -6,
+            bottom: `${20 + noiseFloor * 20 - 5}px`,
+            fontSize: 6,
+            color: `${gateColor}70`,
+            letterSpacing: "0.08em",
+            pointerEvents: "none",
+          }}
+        >
+          ⌇ NOISE
+        </div>
+      )}
       {/* Center marker */}
       <div
         style={{
@@ -319,6 +598,41 @@ function HudWaveform({ isActive, volume }: { isActive: boolean; volume: number }
           background: `${color}20`,
         }}
       />
+      {/* Gate status badge embedded in waveform area */}
+      {isActive && (
+        <div
+          style={{
+            position: "absolute",
+            top: -6,
+            left: 4,
+            display: "flex",
+            alignItems: "center",
+            gap: 3,
+            padding: "1px 6px",
+            borderRadius: 3,
+            background: `${gateColor}15`,
+            border: `1px solid ${gateColor}30`,
+            fontSize: 7,
+            color: gateColor,
+            letterSpacing: "0.1em",
+            fontWeight: 500,
+            transition: "all 0.3s ease",
+          }}
+        >
+          <span
+            style={{
+              display: "inline-block",
+              width: 4,
+              height: 4,
+              borderRadius: "50%",
+              background: gateColor,
+              boxShadow: noiseGateOpen ? `0 0 4px ${gateColor}` : "none",
+              animation: noiseGateOpen ? "pulse-dot 2s ease-in-out infinite" : "none",
+            }}
+          />
+          {noiseGateOpen ? "GATE: OPEN" : "GATE: CLOSED"}
+        </div>
+      )}
       {Array.from({ length: barCount }).map((_, i) => {
         const center = barCount / 2;
         const dist = Math.abs(i - center) / center;
@@ -326,16 +640,19 @@ function HudWaveform({ isActive, volume }: { isActive: boolean; volume: number }
         const wave = Math.sin(phase + now * 0.0015) * 0.5 + 0.5;
         const idleHeight = 3 + wave * 16 + Math.sin(i * 0.08) * 4;
         const activeHeight = 3 + wave * 28 + Math.sin(i * 0.12 + now * 0.004) * 10;
-        const h = isActive ? activeHeight * (0.6 + volume * 0.5) : idleHeight;
+        // When gate is closed, show a minimal idle-like waveform
+        const effectiveVolume = noiseGateOpen ? volume : 0;
+        const h = isActive ? activeHeight * (0.6 + effectiveVolume * 0.5) : idleHeight;
         return (
           <div
             key={i}
             style={{
               width: 2,
               borderRadius: 1,
-              background: `linear-gradient(to top, transparent 0%, ${color}${isActive ? "cc" : "50"} 50%, ${color}${isActive ? "ff" : "80"} 100%)`,
+              background: `linear-gradient(to top, transparent 0%, ${color}${isActive && noiseGateOpen ? "cc" : "50"} 50%, ${color}${isActive && noiseGateOpen ? "ff" : "80"} 100%)`,
               height: Math.max(2, h),
-              opacity: isActive ? 0.5 + volume * 0.5 : 0.25 + (1 - dist) * 0.35,
+              opacity: isActive && noiseGateOpen ? 0.5 + volume * 0.5 : 0.25 + (1 - dist) * 0.35,
+              transition: "opacity 0.1s ease",
             }}
           />
         );
@@ -1160,6 +1477,11 @@ export default function AIVoiceAgentDemo() {
   const [obsidianStatus, setObsidianStatus] = useState<"checking" | "connected" | "disconnected">("checking");
   const [memoryCount, setMemoryCount] = useState(() => getMemories().length);
 
+  // ── Noise suppression state ───────────────────────────────────────────
+  const [noiseGateOpen, setNoiseGateOpen] = useState(false);
+  const [noiseFloor, setNoiseFloor] = useState(0);
+  const [noiseReductionActive, setNoiseReductionActive] = useState(true);
+
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const recognitionRef = useRef<any>(null);
@@ -1167,9 +1489,14 @@ export default function AIVoiceAgentDemo() {
   const voicesRef = useRef<SpeechSynthesisVoice[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const gainNodeRef = useRef<GainNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const animationFrameRef = useRef<number>(0);
-  const currentUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  // Noise gate tracking refs (no re-render overhead)
+  const noiseFloorRef = useRef(0.035); // tracked noise floor level
+  const smoothedRmsRef = useRef(0);
+  const gateOpenRef = useRef(true);
+  const rmsHistoryRef = useRef<number[]>([]);
   const messagesRef = useRef<ChatMessage[]>([]);
   const pendingRef = useRef(false);
 
@@ -1271,6 +1598,12 @@ export default function AIVoiceAgentDemo() {
 
   // ── Volume analysis from mic ─────────────────────────────────────────────
 
+  /**
+   * Adaptive noise gate that tracks the ambient noise floor and
+   * applies hysteresis-based gating so only speech gets through.
+   * Uses a rolling RMS buffer to distinguish speech from background noise
+   * with smoothing to avoid audio artifacts.
+   */
   const startVolumeAnalysis = useCallback(async (stream: MediaStream) => {
     try {
       const audioCtx = new AudioContext();
@@ -1278,10 +1611,34 @@ export default function AIVoiceAgentDemo() {
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
       analyser.fftSize = 256;
-      source.connect(analyser);
+
+      // Insert a GainNode for visual gating — when the gate is closed
+      // the gain drops to near-zero, which the analyser reflects.
+      const gainNode = audioCtx.createGain();
+      gainNode.gain.value = 1.0;
+      gainNodeRef.current = gainNode;
+
+      source.connect(gainNode);
+      gainNode.connect(analyser);
       analyserRef.current = analyser;
 
+      // Pre-fill some RMS history so the noise floor estimate is stable
+      const rmsHistory: number[] = new Array(30).fill(0.03);
+
+      // ── Adaptive noise gate parameters ────────────────────────────
+      const NOISE_FLOOR_LEARN_RATE = 0.002;       // how fast floor adapts upward
+      const NOISE_FLOOR_DECAY_RATE = 0.0005;      // how fast floor decays when signal drops
+      const GATE_THRESHOLD_MULTIPLIER = 2.8;       // gate opens when signal > floor * this
+      const HYSTERESIS = 0.35;                     // gate stays open until signal < floor * (mult - hysteresis)
+      const HANG_TIME_MS = 180;                    // ms to stay open after speech ends (avoids choppiness)
+      const ATTACK_MS = 8;                         // ms to ramp gain up when gate opens
+      const RELEASE_MS = 60;                       // ms to ramp gain down when gate closes
+
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      let hangTimer = 0;
+      let prevGateOpen = true;
+      let currentGain = 1.0;
+      let lastGateChange = 0;
 
       const updateVolume = () => {
         if (!analyserRef.current) return;
@@ -1291,8 +1648,95 @@ export default function AIVoiceAgentDemo() {
           const value = (dataArray[i] - 128) / 128;
           sum += value * value;
         }
-        const rms = Math.sqrt(sum / dataArray.length);
-        setVolume(Math.min(rms * 3, 1));
+        const rawRms = Math.sqrt(sum / dataArray.length);
+
+        // Smooth the RMS to avoid jitter
+        const smoothed = 0.65 * smoothedRmsRef.current + 0.35 * rawRms;
+        smoothedRmsRef.current = smoothed;
+
+        // Track rolling RMS history for noise floor estimation
+        rmsHistory.push(smoothed);
+        if (rmsHistory.length > 60) rmsHistory.shift();
+
+        // ── Adaptive noise floor ─────────────────────────────────────
+        // Find the bottom 20th percentile as the noise floor estimate
+        const sorted = [...rmsHistory].sort((a, b) => a - b);
+        const p20 = sorted[Math.floor(sorted.length * 0.2)] || 0.01;
+
+        // Slow attack, fast-ish decay: floor rises slowly with sustained noise,
+        // falls gradually when signal is quiet.
+        const currentFloor = noiseFloorRef.current;
+        if (p20 > currentFloor) {
+          // Floor is rising — new noise source (fan, AC, etc.)
+          noiseFloorRef.current = currentFloor + (p20 - currentFloor) * NOISE_FLOOR_LEARN_RATE;
+        } else {
+          // Floor is falling — environment got quieter
+          noiseFloorRef.current = currentFloor + (p20 - currentFloor) * NOISE_FLOOR_DECAY_RATE * 2;
+        }
+        // Clamp floor to prevent it from going to zero or exploding
+        noiseFloorRef.current = Math.max(0.008, Math.min(0.3, noiseFloorRef.current));
+
+        const floor = noiseFloorRef.current;
+        const gateThreshold = floor * GATE_THRESHOLD_MULTIPLIER;
+        const closeThreshold = floor * Math.max(1.2, GATE_THRESHOLD_MULTIPLIER - HYSTERESIS);
+
+        // ── Gate decision ───────────────────────────────────────────
+        const now = performance.now();
+        let gateOpen = gateOpenRef.current;
+
+        if (smoothed > gateThreshold) {
+          // Signal is clearly above noise → open gate
+          gateOpen = true;
+          hangTimer = HANG_TIME_MS;
+        } else if (smoothed < closeThreshold) {
+          if (gateOpen) {
+            // Signal dropped below close threshold — start hang timer
+            if (hangTimer > 0) {
+              hangTimer -= 16; // ~60fps frame time
+            } else {
+              gateOpen = false;
+            }
+          } else {
+            gateOpen = false;
+          }
+        } else {
+          // In the hysteresis zone — maintain current state
+          if (gateOpen) {
+            if (hangTimer > 0) {
+              hangTimer -= 16;
+            } else {
+              gateOpen = false;
+            }
+          }
+        }
+        gateOpenRef.current = gateOpen;
+
+        // ── Smooth gain transitions to avoid clicks/pops ─────────────
+        if (gateOpen !== prevGateOpen || currentGain !== (gateOpen ? 1.0 : 0.0)) {
+          lastGateChange = now;
+        }
+
+        const targetGain = gateOpen ? 1.0 : 0.01; // near-zero instead of zero to avoid total silence artifacts
+        const rampTime = gateOpen ? ATTACK_MS : RELEASE_MS;
+        const elapsed = now - lastGateChange;
+        const t = Math.min(1, elapsed / rampTime);
+
+        // Cubic ease for natural-sounding transitions
+        currentGain = currentGain + (targetGain - currentGain) * (t * t * (3 - 2 * t));
+        currentGain = Math.max(0.01, currentGain);
+
+        if (gainNodeRef.current) {
+          gainNodeRef.current.gain.value = currentGain;
+        }
+
+        prevGateOpen = gateOpen;
+
+        // ── Update React state (throttled to avoid excessive re-renders) ──
+        const displayVolume = Math.min(rawRms * 3, 1);
+        setVolume(displayVolume);
+        setNoiseGateOpen(gateOpen);
+        setNoiseFloor(Math.min(floor * 6, 1));
+
         animationFrameRef.current = requestAnimationFrame(updateVolume);
       };
       updateVolume();
@@ -1308,7 +1752,15 @@ export default function AIVoiceAgentDemo() {
       audioContextRef.current = null;
     }
     analyserRef.current = null;
+    gainNodeRef.current = null;
     setVolume(0);
+    setNoiseGateOpen(false);
+    setNoiseFloor(0);
+    // Reset noise floor ref for next session
+    noiseFloorRef.current = 0.035;
+    smoothedRmsRef.current = 0;
+    gateOpenRef.current = false;
+    rmsHistoryRef.current = [];
   }, []);
 
   // ── Speech Recognition ───────────────────────────────────────────────────
@@ -1362,12 +1814,34 @@ export default function AIVoiceAgentDemo() {
     recognitionRef.current = recognition;
 
     navigator.mediaDevices
-      .getUserMedia({ audio: true })
+      .getUserMedia({
+        audio: {
+          noiseSuppression: true,
+          echoCancellation: true,
+          autoGainControl: true,
+        },
+      })
       .then((stream) => {
+        // Check if browser's built-in noise suppression is actually active
+        const track = stream.getAudioTracks()[0];
+        if (track) {
+          const settings = track.getSettings();
+          const hasNs = settings.noiseSuppression !== false;
+          setNoiseReductionActive(hasNs);
+        }
         mediaStreamRef.current = stream;
         startVolumeAnalysis(stream);
       })
-      .catch(() => {});
+      .catch(() => {
+        // Fallback without constraints if browser doesn't support them
+        navigator.mediaDevices
+          .getUserMedia({ audio: true })
+          .then((stream) => {
+            mediaStreamRef.current = stream;
+            startVolumeAnalysis(stream);
+          })
+          .catch(() => {});
+      });
 
     recognition.start();
     setVoiceStatus("listening");
@@ -1405,55 +1879,123 @@ export default function AIVoiceAgentDemo() {
     }
   }, [voiceStatus, startListening, stopListening]);
 
-  // ── Text-to-Speech ───────────────────────────────────────────────────────
+  // ── Text-to-Speech (enhanced browser SpeechSynthesis) ────────────────────
+  // Uses the browser's built-in TTS engine with optimized voice selection
+  // and natural speaking parameters for the most human-like sound possible
+  // without a cloud TTS API.
+
+  const speechChunksRef = useRef<{ text: string; rate: number; pitch: number; pauseAfter: number }[]>([]);
+  const speechChunkIdxRef = useRef(0);
+  const speechCancelledRef = useRef(false);
+  const speechTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /** Pick the best available voice — prefer Microsoft neural voices on Windows. */
+  const pickBestVoice = useCallback((): SpeechSynthesisVoice | null => {
+    const voices = synthRef.current?.getVoices() || [];
+    if (voices.length === 0) return null;
+
+    // Preferred voice name fragments (ordered by quality)
+    const preferred = [
+      "Microsoft Jenny",    // Windows 11 neural — excellent
+      "Microsoft Aria",     // Windows 11 neural — excellent
+      "Microsoft Guy",      // Windows 11 neural — great
+      "Microsoft Sara",     // Windows 11 neural
+      "Microsoft David",    // Windows 10 — good
+      "Microsoft Zira",     // Windows 10 — good
+      "Google UK English Female",
+      "Google US English",
+      "Samantha",           // macOS
+    ];
+
+    for (const name of preferred) {
+      const found = voices.find((v) => v.name.includes(name));
+      if (found) return found;
+    }
+
+    // Fallback: first English voice
+    return voices.find((v) => v.lang.startsWith("en")) || voices[0];
+  }, []);
 
   const speakText = useCallback(
-    (text: string): Promise<void> => {
-      return new Promise((resolve) => {
-        if (!synthRef.current || !voiceEnabled) {
-          resolve();
+    async (text: string): Promise<void> => {
+      if (!voiceEnabled || !synthRef.current) return;
+
+      // Cancel any active speech
+      synthRef.current.cancel();
+      speechCancelledRef.current = false;
+      if (speechTimeoutRef.current) {
+        clearTimeout(speechTimeoutRef.current);
+        speechTimeoutRef.current = null;
+      }
+
+      const rawChunks = prepareSpeechChunks(text);
+      if (rawChunks.length === 0) return;
+
+      // Store full chunk data including expressive rate/pitch from SSML analysis
+      speechChunksRef.current = rawChunks.map((c) => ({
+        text: c.text,
+        rate: c.rate,
+        pitch: c.pitch,
+        pauseAfter: c.pauseAfter,
+      }));
+      speechChunkIdxRef.current = 0;
+
+      const voice = pickBestVoice();
+
+      setVoiceStatus("speaking");
+
+      const speakNext = () => {
+        if (speechCancelledRef.current || speechChunkIdxRef.current >= speechChunksRef.current.length) {
+          setVoiceStatus("idle");
           return;
         }
 
-        synthRef.current.cancel();
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.rate = 0.95;
-        utterance.pitch = 1.0;
+        const chunk = speechChunksRef.current[speechChunkIdxRef.current];
+        const utterance = new SpeechSynthesisUtterance(chunk.text);
+
+        // Per-chunk expressive speaking parameters (from SSML analysis)
+        utterance.rate = chunk.rate;
+        utterance.pitch = chunk.pitch;
         utterance.volume = 1.0;
 
-        const voices = voicesRef.current;
-        const preferredVoice =
-          voices.find((v) => v.name.includes("Google UK English Female")) ||
-          voices.find((v) => v.name.includes("Samantha")) ||
-          voices.find((v) => v.lang.startsWith("en")) ||
-          voices[0];
-        if (preferredVoice) utterance.voice = preferredVoice;
-
-        currentUtteranceRef.current = utterance;
-        setVoiceStatus("speaking");
+        if (voice) utterance.voice = voice;
 
         utterance.onend = () => {
-          currentUtteranceRef.current = null;
-          setVoiceStatus("idle");
-          resolve();
-        };
-        utterance.onerror = () => {
-          currentUtteranceRef.current = null;
-          setVoiceStatus("idle");
-          resolve();
+          speechChunkIdxRef.current++;
+          if (!speechCancelledRef.current && chunk.pauseAfter > 0 && speechChunkIdxRef.current < speechChunksRef.current.length) {
+            speechTimeoutRef.current = setTimeout(speakNext, chunk.pauseAfter);
+          } else {
+            speakNext();
+          }
         };
 
-        synthRef.current.speak(utterance);
-      });
+        utterance.onerror = () => {
+          // On error, skip to next chunk
+          speechChunkIdxRef.current++;
+          speakNext();
+        };
+
+        if (synthRef.current) {
+          synthRef.current.speak(utterance);
+        } else {
+          speakNext();
+        }
+      };
+
+      speakNext();
     },
-    [voiceEnabled]
+    [voiceEnabled, pickBestVoice]
   );
 
   const cancelSpeech = useCallback(() => {
+    speechCancelledRef.current = true;
+    if (speechTimeoutRef.current) {
+      clearTimeout(speechTimeoutRef.current);
+      speechTimeoutRef.current = null;
+    }
     if (synthRef.current) {
       synthRef.current.cancel();
     }
-    currentUtteranceRef.current = null;
     setVoiceStatus("idle");
   }, []);
 
@@ -1523,8 +2065,11 @@ export default function AIVoiceAgentDemo() {
 
           const body: Record<string, unknown> = {
             model: "meta/llama-3.1-70b-instruct",
-            max_tokens: 4096,
-            temperature: 0.5,
+            max_tokens: 8192,
+            temperature: 0.75,
+            top_p: 0.9,
+            frequency_penalty: 0.3,
+            presence_penalty: 0.2,
             messages,
           };
           if (toolsForAPI.length > 0) {
@@ -1640,6 +2185,9 @@ export default function AIVoiceAgentDemo() {
         }
 
         finalReply = finalReply.trim() || "Got it.";
+
+        // ── Humanize the response ────────────────────────────────
+        finalReply = humanizeResponse(finalReply);
 
         const assistantMsg: ChatMessage = {
           role: "assistant",
@@ -2042,6 +2590,22 @@ export default function AIVoiceAgentDemo() {
               </span>
             </div>
             <div style={{ width: 1, height: 10, background: `${HUD_PRIMARY}20` }} />
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <div
+                style={{
+                  width: 5,
+                  height: 5,
+                  borderRadius: "50%",
+                  background: noiseGateOpen && voiceStatus === "listening" ? "#22c55e" : `${HUD_PRIMARY}40`,
+                  boxShadow: noiseGateOpen && voiceStatus === "listening" ? "0 0 6px #22c55e" : "none",
+                  animation: noiseGateOpen && voiceStatus === "listening" ? "pulse-dot 2s ease-in-out infinite" : "none",
+                }}
+              />
+              <span style={{ fontSize: 8, color: `${HUD_PRIMARY}60`, letterSpacing: "0.1em" }}>
+                NR: {noiseReductionActive ? "ON" : "OFF"}
+              </span>
+            </div>
+            <div style={{ width: 1, height: 10, background: `${HUD_PRIMARY}20` }} />
             <span style={{ fontSize: 8, color: `${HUD_PRIMARY}40`, letterSpacing: "0.1em" }}>
               {voiceStatus === "idle" ? "IDLE" : voiceStatus === "listening" ? "RECEIVING" : voiceStatus === "processing" ? "ANALYZING" : "TRANSMITTING"}
             </span>
@@ -2081,7 +2645,12 @@ export default function AIVoiceAgentDemo() {
               maxWidth: 560,
             }}
           >
-            <HudWaveform isActive={voiceStatus === "listening"} volume={volume} />
+            <HudWaveform
+              isActive={voiceStatus === "listening"}
+              volume={volume}
+              noiseFloor={noiseFloor}
+              noiseGateOpen={noiseGateOpen}
+            />
           </div>
 
           {/* ── Scanning line (slow sweep) ─────────────────────────── */}

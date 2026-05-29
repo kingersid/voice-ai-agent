@@ -137,7 +137,6 @@ app.get("/api/vault/status", (_req, res) => {
     workDir: WORK_DIR,
   });
 });
-
 // ─── Code Execution: Write File ──────────────────────────────────────────
 // POST /api/exec/write-file
 // Body: { path: string, content: string }
